@@ -2,45 +2,29 @@
 """
 mapscout.py — Detecção de JavaScript Source Maps expostos.
 
-Inspirado no DotMap (extensão de browser), mas em linha de comando.
-Recebe uma lista de URLs de JS (ou coleta via Playwright) e verifica
-se o arquivo .map correspondente está publicamente acessível.
+Recebe uma lista de URLs de JS e verifica se o arquivo .map correspondente
+está publicamente acessível e é um source map real (JSON válido).
 
-Fluxo:
-  1. Entrada: lista de URLs JS (arquivo ou stdin) ou domínio direto
-  2. Coleta ao vivo opcional via Playwright (--live)
-  3. HEAD request para <url>.map em cada arquivo JS
-  4. Relatório: TXT + JSONL + HTML interativo
+Pode ser chamado diretamente pelo jsrecon.py ou usado de forma standalone.
+
+Uso standalone:
+    python3 mapscout.py -f js_urls.txt --domains subdomains.txt
+    python3 mapscout.py -f js_urls.txt --domain ifood.com.br
+    cat js_urls.txt | python3 mapscout.py --domain ifood.com.br
 
 Dependências Python:
-    pip install requests playwright tenacity
-    playwright install chromium   (apenas se usar --live)
-
-Uso:
-    # A partir de lista de JS já coletados (ex: saída do jsrecon)
-    python3 mapscout.py -f js_urls.txt
-
-    # Coleta ao vivo direto do domínio
-    python3 mapscout.py --live exemplo.com.br
-
-    # Stdin (pipe)
-    cat js_urls.txt | python3 mapscout.py
-
-    # Com relatório HTML
-    python3 mapscout.py -f js_urls.txt --html
+    pip install requests tenacity
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import re
 import sys
 import threading
 import time
-import urllib.parse
 import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -59,38 +43,25 @@ from tenacity import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CDN — ignora JS de terceiros
-# ─────────────────────────────────────────────────────────────────────────────
-
-_CDN_RE = re.compile(
-    r'(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|'
-    r'ajax\.googleapis\.com|stackpath\.bootstrapcdn\.com|'
-    r'maxcdn\.bootstrapcdn\.com|code\.jquery\.com|'
-    r'cdn\.datatables\.net|cdn\.polyfill\.io|'
-    r'static\.cloudflareinsights\.com)',
-    re.I,
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Estado global thread-safe
 # ─────────────────────────────────────────────────────────────────────────────
 
-_checked:      set[str]       = set()
-_checked_lock: threading.Lock = threading.Lock()
-_findings:     list[dict]     = []
-_findings_lock: threading.Lock = threading.Lock()
+_checked:       set[str]        = set()
+_checked_lock:  threading.Lock  = threading.Lock()
+_findings:      list[dict]      = []
+_findings_lock: threading.Lock  = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_logging(log_file: Path | None = None) -> logging.Logger:
+def setup_logging(log_file: Path | None = None, quiet: bool = False) -> logging.Logger:
     logger = logging.getLogger("mapscout")
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
 
     ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.WARNING if quiet else logging.INFO)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
@@ -105,12 +76,47 @@ def setup_logging(log_file: Path | None = None) -> logging.Logger:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Filtro de domínio alvo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_domain_filter(root_domain: str, extra_hosts: set[str]) -> callable:
+    """
+    Retorna uma função que aceita uma URL e diz se ela pertence ao target.
+    Regras:
+      - host == root_domain
+      - host termina com .root_domain
+      - host está no conjunto extra_hosts (subdomínios confirmados pelo httpx)
+    """
+    root = root_domain.lower().lstrip("*.")
+
+    def _ok(url: str) -> bool:
+        host = urlparse(url).netloc.lower().split(":")[0]
+        if host == root:
+            return True
+        if host.endswith(f".{root}"):
+            return True
+        if host in extra_hosts:
+            return True
+        return False
+
+    return _ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP — semáforo por host + retry
 # ─────────────────────────────────────────────────────────────────────────────
 
 _host_sems: dict[str, threading.Semaphore] = {}
 _host_lock  = threading.Lock()
 _req_logger = logging.getLogger("mapscout.req")
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 
 def _sem(url: str) -> threading.Semaphore:
@@ -121,7 +127,7 @@ def _sem(url: str) -> threading.Semaphore:
         return _host_sems[host]
 
 
-def _make_head(timeout: int):
+def _make_get(timeout: int):
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=1, min=2, max=15),
@@ -132,38 +138,113 @@ def _make_head(timeout: int):
         before_sleep=before_sleep_log(_req_logger, logging.DEBUG),
         reraise=False,
     )
-    def _head(url: str) -> requests.Response | None:
+    def _get(url: str, stream: bool = False) -> requests.Response | None:
         with _sem(url):
-            r = requests.head(
+            r = requests.get(
                 url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    )
-                },
+                headers=HEADERS,
                 timeout=timeout,
                 verify=False,
                 allow_redirects=True,
+                stream=stream,
             )
             if r.status_code == 429:
                 time.sleep(min(int(r.headers.get("Retry-After", 10)), 30))
             return r
-    return _head
+    return _get
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Verificação de .map
+# Validação real do .map
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_map(js_url: str, head_fn, logger: logging.Logger) -> dict | None:
+# Indicadores que confirmam um source map JSON real
+_SOURCEMAP_KEYS = re.compile(
+    r'"version"\s*:\s*3|"sources"\s*:\s*\[|"mappings"\s*:|'
+    r'"sourceRoot"\s*:|"sourcesContent"\s*:',
+    re.I,
+)
+# Indicadores de página de erro / WAF / HTML
+_ERROR_PAGE_RE = re.compile(
+    r'<html|<!doctype|<body|access denied|forbidden|not found|'
+    r'cloudflare|captcha|error\s+\d{3}',
+    re.I,
+)
+# Tamanho mínimo razoável de um source map real (bytes lidos para checar)
+_PEEK_BYTES = 4096
+_MIN_MAP_SIZE = 64
+
+
+def _is_real_sourcemap(resp: requests.Response) -> bool:
     """
-    Verifica se <js_url>.map retorna HTTP 200.
+    Valida se a resposta é um source map JavaScript real.
+    Critérios (qualquer um basta):
+      1. Content-Type contém 'json' ou 'sourcemap'
+      2. Os primeiros bytes contêm chaves típicas de source map v3
+    Rejeita se:
+      - Status != 200
+      - Conteúdo parece HTML / página de erro
+      - Tamanho trivialmente pequeno
+    """
+    if resp.status_code != 200:
+        return False
+
+    ct = resp.headers.get("Content-Type", "").lower()
+
+    # Lê apenas os primeiros bytes para não baixar arquivos enormes
+    try:
+        # stream=True foi passado — lê chunk inicial
+        peek = b""
+        for chunk in resp.iter_content(chunk_size=_PEEK_BYTES):
+            peek += chunk
+            break
+        resp.close()
+        text = peek.decode("utf-8", errors="replace")
+    except Exception:
+        return False
+
+    if len(text.strip()) < _MIN_MAP_SIZE:
+        return False
+
+    if _ERROR_PAGE_RE.search(text[:512]):
+        return False
+
+    # Content-Type JSON já é forte indicador
+    if "json" in ct or "sourcemap" in ct or "octet-stream" in ct:
+        if _SOURCEMAP_KEYS.search(text):
+            return True
+        # Mesmo sem as chaves, se o CT é JSON e não é HTML, aceita
+        if "json" in ct and not _ERROR_PAGE_RE.search(text[:512]):
+            return True
+
+    # Sem CT ideal: exige presença das chaves de source map
+    if _SOURCEMAP_KEYS.search(text):
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Verificação de .map por URL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_map(
+    js_url: str,
+    get_fn,
+    domain_ok: callable,
+    logger: logging.Logger,
+) -> dict | None:
+    """
+    Verifica se <js_url>.map existe e é um source map real.
     Retorna dict com o finding ou None.
     """
-    # Normaliza: remove query string para a chave de dedup
     key = js_url.split("?")[0]
+
+    # Filtro de domínio — só checa URLs do target
+    if not domain_ok(js_url):
+        logger.debug("[SKIP domain] %s", js_url)
+        return None
+
     with _checked_lock:
         if key in _checked:
             return None
@@ -172,7 +253,7 @@ def check_map(js_url: str, head_fn, logger: logging.Logger) -> dict | None:
     map_url = key + ".map"
 
     try:
-        resp = head_fn(map_url)
+        resp = get_fn(map_url, stream=True)
     except Exception as e:
         logger.debug("Erro ao checar %s: %s", map_url, e)
         return None
@@ -180,48 +261,72 @@ def check_map(js_url: str, head_fn, logger: logging.Logger) -> dict | None:
     if resp is None:
         return None
 
-    parsed   = urlparse(js_url)
-    domain   = parsed.netloc
-    status   = resp.status_code
-    size     = resp.headers.get("Content-Length", "?")
-    ct       = resp.headers.get("Content-Type", "")
+    parsed = urlparse(js_url)
+    domain = parsed.netloc
+    status = resp.status_code
+    size   = resp.headers.get("Content-Length", "?")
+    ct     = resp.headers.get("Content-Type", "")
 
-    if status == 200:
-        finding = {
-            "js_url":   js_url,
-            "map_url":  map_url,
-            "domain":   domain,
-            "status":   status,
-            "size":     size,
-            "content_type": ct,
-            "ts":       datetime.now(timezone.utc).isoformat(),
-        }
-        with _findings_lock:
-            _findings.append(finding)
-        logger.warning("[MAP EXPOSTO] %s  (size: %s, ct: %s)", map_url, size, ct)
-        return finding
+    if not _is_real_sourcemap(resp):
+        logger.debug("[%d / não-sourcemap] %s", status, map_url)
+        return None
 
-    logger.debug("[%d] %s", status, map_url)
-    return None
+    finding = {
+        "js_url":       js_url,
+        "map_url":      map_url,
+        "domain":       domain,
+        "status":       status,
+        "size":         size,
+        "content_type": ct,
+        "ts":           datetime.now(timezone.utc).isoformat(),
+    }
+
+    with _findings_lock:
+        _findings.append(finding)
+
+    logger.warning("[MAP REAL EXPOSTO] %s  (size: %s, ct: %s)", map_url, size, ct)
+    return finding
 
 
-def check_all(js_urls: list[str], workers: int, timeout: int,
-              logger: logging.Logger) -> list[dict]:
+def check_all(
+    js_urls: list[str],
+    root_domain: str,
+    extra_hosts: set[str],
+    workers: int,
+    timeout: int,
+    logger: logging.Logger,
+) -> list[dict]:
     """Verifica todos os JS em paralelo. Retorna lista de findings."""
     if not js_urls:
         logger.warning("Nenhuma URL JS fornecida.")
         return []
 
-    head_fn = _make_head(timeout)
-    logger.info("Verificando %d arquivos JS (workers=%d)…", len(js_urls), workers)
+    domain_ok = _build_domain_filter(root_domain, extra_hosts)
+    get_fn    = _make_get(timeout)
+
+    # Filtra antes de paralelizar para logar o total real
+    target_urls = [u for u in js_urls if domain_ok(u)]
+    skipped     = len(js_urls) - len(target_urls)
+
+    logger.info(
+        "mapscout: %d JS do target (ignorados %d fora do escopo)",
+        len(target_urls), skipped,
+    )
+
+    if not target_urls:
+        logger.warning("Nenhuma URL pertence ao target %s / *.%s", root_domain, root_domain)
+        return []
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(check_map, u, head_fn, logger): u for u in js_urls}
+        futs = {
+            ex.submit(check_map, u, get_fn, domain_ok, logger): u
+            for u in target_urls
+        }
         done = 0
         for fut in as_completed(futs):
             done += 1
-            if done % 100 == 0:
-                logger.info("  %d/%d verificados…", done, len(js_urls))
+            if done % 50 == 0 or done == len(target_urls):
+                logger.info("  mapscout: %d/%d verificados…", done, len(target_urls))
             try:
                 fut.result()
             except Exception as e:
@@ -231,102 +336,34 @@ def check_all(js_urls: list[str], workers: int, timeout: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Coleta ao vivo com Playwright
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _playwright_collect(url: str, timeout_s: int, wait_s: int,
-                               headless: bool, logger: logging.Logger) -> list[str]:
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        logger.error("Playwright não instalado. Execute:")
-        logger.error("  pip install playwright && playwright install chromium")
-        return []
-
-    js_urls: list[str] = []
-    seen: set[str] = set()
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless)
-        ctx     = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            ignore_https_errors=True,
-        )
-        page = await ctx.new_page()
-
-        def on_request(req):
-            ru     = req.url
-            parsed = urlparse(ru)
-            path   = parsed.path.lower()
-            # Captura .js mas ignora .js.map (não queremos checar mapa do mapa)
-            if ".js" in path and not path.endswith(".js.map") and ru not in seen:
-                if not _CDN_RE.search(ru):
-                    seen.add(ru)
-                    js_urls.append(ru)
-
-        page.on("request", on_request)
-        logger.info("  🌐 Browser → %s", url)
-        try:
-            await page.goto(url, timeout=timeout_s * 1000, wait_until="networkidle")
-        except Exception as e:
-            logger.debug("  [browser] timeout em %s: %s", url, e)
-
-        if wait_s > 0:
-            await asyncio.sleep(wait_s)
-
-        await browser.close()
-
-    logger.info("  → %d JS capturados ao vivo", len(js_urls))
-    return js_urls
-
-
-def live_collect(targets: list[str], timeout_s: int, wait_s: int,
-                 headless: bool, logger: logging.Logger) -> list[str]:
-    """Roda Playwright em cada alvo e retorna lista de JS únicos."""
-    all_js: list[str] = []
-    seen: set[str] = set()
-
-    async def _run():
-        for idx, url in enumerate(targets, 1):
-            logger.info("[live %d/%d] %s", idx, len(targets), url)
-            urls = await _playwright_collect(url, timeout_s, wait_s, headless, logger)
-            for u in urls:
-                key = u.split("?")[0]
-                if key not in seen:
-                    seen.add(key)
-                    all_js.append(u)
-
-    asyncio.run(_run())
-    logger.info("Total JS coletados ao vivo (únicos): %d", len(all_js))
-    return all_js
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Output
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _esc(s: str) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def write_txt(findings: list[dict], path: Path, logger: logging.Logger) -> None:
     if not findings:
         return
     lines = []
-    # Agrupa por domínio (mesma UX do DotMap)
     by_domain: dict[str, list[dict]] = {}
     for f in findings:
         by_domain.setdefault(f["domain"], []).append(f)
 
     for domain, items in sorted(by_domain.items()):
-        lines.append(f"{'═'*60}")
-        lines.append(f"  DOMÍNIO: {domain}  ({len(items)} map(s) exposto(s))")
-        lines.append(f"{'═'*60}")
+        lines += [
+            "═" * 60,
+            f"  DOMÍNIO: {domain}  ({len(items)} map(s) exposto(s))",
+            "═" * 60,
+        ]
         for item in items:
-            lines.append(f"  JS  : {item['js_url']}")
-            lines.append(f"  MAP : {item['map_url']}")
-            lines.append(f"  Size: {item['size']}  CT: {item['content_type']}")
-            lines.append(f"  {'-'*56}")
+            lines += [
+                f"  JS  : {item['js_url']}",
+                f"  MAP : {item['map_url']}",
+                f"  Size: {item['size']}  CT: {item['content_type']}",
+                "-" * 56,
+            ]
         lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,15 +381,16 @@ def write_jsonl(findings: list[dict], path: Path, logger: logging.Logger) -> Non
     logger.info("JSONL → %s", path)
 
 
-def write_html(findings: list[dict], path: Path, domain_label: str,
-               logger: logging.Logger) -> None:
+def write_html(
+    findings: list[dict],
+    path: Path,
+    domain_label: str,
+    logger: logging.Logger,
+) -> None:
     if not findings:
+        logger.info("Nenhum finding — HTML não gerado.")
         return
 
-    def _esc(s: str) -> str:
-        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    # Agrupa por domínio
     by_domain: dict[str, list[dict]] = {}
     for f in findings:
         by_domain.setdefault(f["domain"], []).append(f)
@@ -362,21 +400,21 @@ def write_html(findings: list[dict], path: Path, domain_label: str,
         rows = ""
         for item in items:
             rows += (
-                f'<tr>'
+                f"<tr>"
                 f'<td class="url-cell mono"><a href="{item["js_url"]}" target="_blank">'
                 f'{_esc(item["js_url"][:120])}</a></td>'
                 f'<td class="url-cell"><a href="{item["map_url"]}" target="_blank" class="map-link">'
                 f'{_esc(item["map_url"][:120])}</a></td>'
                 f'<td class="center">{_esc(item["size"])}</td>'
                 f'<td class="center">{_esc(item["content_type"][:40])}</td>'
-                f'<td class="center ts">{item["ts"][:19].replace("T"," ")}</td>'
-                f'</tr>\n'
+                f'<td class="center ts">{item["ts"][:19].replace("T", " ")}</td>'
+                "</tr>\n"
             )
         domain_cards += f"""
 <div class="domain-card" data-domain="{_esc(domain)}">
   <div class="domain-header">
     <span class="domain-name">{_esc(domain)}</span>
-    <span class="badge">{len(items)} map{"s" if len(items)>1 else ""}</span>
+    <span class="badge">{len(items)} map{"s" if len(items) > 1 else ""}</span>
     <button class="open-all" onclick="openAll('{_esc(domain)}')">Abrir todos</button>
   </div>
   <table>
@@ -388,11 +426,9 @@ def write_html(findings: list[dict], path: Path, domain_label: str,
 </div>
 """
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ts            = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     total_domains = len(by_domain)
-
-    # Monta opções de domínio para o filtro
-    domain_opts = "".join(
+    domain_opts   = "".join(
         f'<option value="{_esc(d)}">{_esc(d)} ({len(items)})</option>'
         for d, items in sorted(by_domain.items())
     )
@@ -410,7 +446,7 @@ a{{color:#60a5fa;text-decoration:none}}a:hover{{text-decoration:underline}}
 header{{background:#1a1d2e;border-bottom:1px solid #2d3148;padding:1rem 1.5rem;display:flex;align-items:center;gap:1rem}}
 header h1{{font-size:16px;font-weight:700;color:#f1f5f9;flex:1}}
 header p{{font-size:12px;color:#64748b}}
-.banner{{display:flex;gap:.75rem;padding:.75rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap;align-items:center}}
+.banner{{display:flex;gap:.75rem;padding:.75rem 1.5rem;background:#141620;border-bottom:1px solid #2d3148;flex-wrap:wrap}}
 .stat{{background:#1a1d2e;border:1px solid #2d3148;border-radius:6px;padding:.5rem .9rem;text-align:center;min-width:90px}}
 .stat .n{{font-size:22px;font-weight:700;line-height:1.1}}
 .stat .l{{font-size:11px;color:#64748b;margin-top:2px}}
@@ -447,7 +483,6 @@ footer{{padding:.75rem 1.5rem;font-size:11px;color:#334155;border-top:1px solid 
 <div class="banner">
   <div class="stat"><div class="n" style="color:#ef4444">{len(findings)}</div><div class="l">Maps expostos</div></div>
   <div class="stat"><div class="n" style="color:#f97316">{total_domains}</div><div class="l">Domínios</div></div>
-  <div class="stat"><div class="n" style="color:#a78bfa">{sum(1 for f in findings if f.get("size","?")!="?")}</div><div class="l">Com tamanho</div></div>
 </div>
 <div class="ctrl">
   <label>Domínio
@@ -458,34 +493,26 @@ footer{{padding:.75rem 1.5rem;font-size:11px;color:#334155;border-top:1px solid 
   <input id="qs" type="search" placeholder="Buscar URL, domínio…" oninput="filter()">
   <span id="cnt" class="cnt">{total_domains} domínio(s) · {len(findings)} map(s)</span>
 </div>
-<div class="content" id="cards">
-{domain_cards}
-</div>
+<div class="content" id="cards">{domain_cards}</div>
 <footer>mapscout · {_esc(domain_label)} · {len(findings)} source map(s) exposto(s) · {ts}</footer>
 <script>
-// Mapa de links por domínio (para "Abrir todos")
 const domainLinks = {{}};
 document.querySelectorAll('.domain-card').forEach(card => {{
   const d = card.dataset.domain;
   domainLinks[d] = Array.from(card.querySelectorAll('.map-link')).map(a => a.href);
 }});
-
 function openAll(domain) {{
   (domainLinks[domain] || []).forEach(url => window.open(url, '_blank'));
 }}
-
 const cards = Array.from(document.querySelectorAll('.domain-card'));
-
 function filter() {{
   const df = document.getElementById('df').value;
   const q  = document.getElementById('qs').value.toLowerCase();
   let visible = 0;
   cards.forEach(card => {{
-    const domainMatch = !df || card.dataset.domain === df;
-    const textMatch   = !q  || card.textContent.toLowerCase().includes(q);
-    const show = domainMatch && textMatch;
-    card.classList.toggle('hidden', !show);
-    if (show) visible++;
+    const ok = (!df || card.dataset.domain === df) && (!q || card.textContent.toLowerCase().includes(q));
+    card.classList.toggle('hidden', !ok);
+    if (ok) visible++;
   }});
   document.getElementById('cnt').textContent = visible + ' domínio(s) visível(is)';
 }}
@@ -499,173 +526,139 @@ function filter() {{
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Leitura de entrada
+# Entry-point programático (chamado pelo jsrecon)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def read_js_urls(args: argparse.Namespace, logger: logging.Logger) -> list[str]:
-    """Lê URLs de JS de arquivo, stdin ou gera a partir de domínio."""
-    urls: list[str] = []
+def run(
+    js_urls: list[str],
+    root_domain: str,
+    out_dir: Path,
+    *,
+    extra_hosts: set[str] | None = None,
+    workers: int = 20,
+    timeout: int = 8,
+    logger: logging.Logger | None = None,
+) -> list[dict]:
+    """
+    API programática para uso pelo jsrecon.py.
 
-    # A partir de arquivo
-    if args.file:
-        path = Path(args.file)
-        if not path.exists():
-            logger.error("Arquivo não encontrado: %s", args.file)
-            sys.exit(1)
-        raw = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        urls = [l.strip() for l in raw if l.strip() and l.strip().startswith("http")]
-        logger.info("URLs lidas do arquivo: %d", len(urls))
+    Parâmetros
+    ----------
+    js_urls      : lista de URLs JS coletadas
+    root_domain  : domínio raiz do alvo (ex: ifood.com.br)
+    out_dir      : diretório de saída (onde salvar os relatórios)
+    extra_hosts  : conjunto de hosts confirmados pelo httpx (opcional)
+    workers      : paralelismo
+    timeout      : timeout HTTP em segundos
+    logger       : logger do jsrecon (opcional; cria um novo se None)
+    """
+    if logger is None:
+        logger = setup_logging(out_dir / "mapscout.log")
 
-    # A partir de stdin (pipe)
-    elif not sys.stdin.isatty() and not args.live:
-        raw = sys.stdin.read().splitlines()
-        urls = [l.strip() for l in raw if l.strip() and l.strip().startswith("http")]
-        logger.info("URLs lidas do stdin: %d", len(urls))
+    logger.info("═══ mapscout — detecção de source maps ═══")
 
-    # Coleta ao vivo via Playwright
-    if args.live:
-        domain = args.live.strip()
-        for pfx in ("https://", "http://"):
-            if domain.startswith(pfx):
-                domain = domain[len(pfx):]
-        domain = domain.rstrip("/")
+    findings = check_all(
+        js_urls,
+        root_domain=root_domain,
+        extra_hosts=extra_hosts or set(),
+        workers=workers,
+        timeout=timeout,
+        logger=logger,
+    )
 
-        targets = [f"https://{domain}", f"http://{domain}"]
-        logger.info("Modo live: coletando JS de %s…", domain)
-        live_urls = live_collect(
-            targets,
-            timeout_s=args.live_timeout,
-            wait_s=args.live_wait,
-            headless=not args.no_headless,
-            logger=logger,
+    if findings:
+        write_txt(findings,  out_dir / "maps_exposed.txt",  logger)
+        write_jsonl(findings, out_dir / "maps_exposed.jsonl", logger)
+        write_html(findings,  out_dir / "maps_exposed.html", root_domain, logger)
+        logger.warning(
+            "[mapscout] %d source map(s) REAL(IS) exposto(s) → %s",
+            len(findings), out_dir / "maps_exposed.html",
         )
-        # Merge com os que vieram de arquivo/stdin (se houver)
-        existing = set(u.split("?")[0] for u in urls)
-        for u in live_urls:
-            if u.split("?")[0] not in existing:
-                urls.append(u)
-        logger.info("Total após merge com live: %d", len(urls))
+    else:
+        logger.info("[mapscout] Nenhum source map exposto encontrado.")
 
-    if not urls:
-        logger.error("Nenhuma URL JS fornecida. Use -f, stdin ou --live.")
-        sys.exit(1)
-
-    # Remove duplicatas por URL base
-    seen: set[str] = set()
-    dedup: list[str] = []
-    for u in urls:
-        key = u.split("?")[0]
-        if key not in seen:
-            seen.add(key)
-            dedup.append(u)
-
-    logger.info("URLs únicas após dedup: %d", len(dedup))
-    return dedup
+    return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI
+# CLI standalone
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="mapscout",
-        description="Detecta JavaScript Source Maps (.map) expostos publicamente.",
+        description="Detecta JavaScript Source Maps (.map) expostos e válidos.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  # Verifica lista de JS coletados pelo jsrecon
-  python3 mapscout.py -f jsrecon_exemplo.com.br/js_urls.txt
+  # A partir de lista de JS já coletados
+  python3 mapscout.py -f jsrecon_ifood.com.br/js_urls.txt --domain ifood.com.br
 
-  # Coleta ao vivo e verifica
-  python3 mapscout.py --live exemplo.com.br
+  # Com arquivo de subdomínios para filtro mais preciso
+  python3 mapscout.py -f js_urls.txt --domain ifood.com.br --domains subdomains.txt
 
-  # Pipe
-  cat js_urls.txt | python3 mapscout.py
-
-  # Tudo junto com relatório HTML
-  python3 mapscout.py --live exemplo.com.br -f extra_js.txt --html -o resultados/
+  # Stdin
+  cat js_urls.txt | python3 mapscout.py --domain ifood.com.br
         """,
     )
 
-    src = p.add_argument_group("Fonte de URLs")
-    src.add_argument("-f", "--file",       metavar="FILE",   help="Arquivo com URLs JS (uma por linha)")
-    src.add_argument("--live",             metavar="DOMAIN", help="Coleta ao vivo via Playwright no domínio")
-    src.add_argument("--no-headless",      action="store_true", help="Abre browser visível (debug)")
-    src.add_argument("--live-timeout",     type=int, default=30, metavar="S",
-                     help="Timeout de navegação do browser em segundos (padrão: 30)")
-    src.add_argument("--live-wait",        type=int, default=2,  metavar="S",
-                     help="Segundos extras após networkidle (padrão: 2)")
-
-    out = p.add_argument_group("Saída")
-    out.add_argument("-o", "--output-dir", metavar="DIR",    help="Diretório de saída (padrão: ./mapscout_out)")
-    out.add_argument("--html",             action="store_true", help="Gera relatório HTML interativo")
-    out.add_argument("--no-txt",           action="store_true", help="Não gera relatório TXT")
-    out.add_argument("--no-jsonl",         action="store_true", help="Não gera JSONL")
-    out.add_argument("--quiet",            action="store_true", help="Menos output no terminal")
-
-    perf = p.add_argument_group("Performance")
-    perf.add_argument("--workers",  type=int, default=20,  help="Workers paralelos (padrão: 20)")
-    perf.add_argument("--timeout",  type=int, default=8,   help="Timeout HTTP por request em segundos (padrão: 8)")
-
+    p.add_argument("-f", "--file",    metavar="FILE",   help="Arquivo com URLs JS (uma por linha)")
+    p.add_argument("--domain",        metavar="DOMAIN", required=True,
+                   help="Domínio raiz do alvo (ex: ifood.com.br)")
+    p.add_argument("--domains",       metavar="FILE",
+                   help="Arquivo com subdomínios válidos (ex: saída do jsrecon subdomains.txt)")
+    p.add_argument("-o", "--output-dir", metavar="DIR", default="mapscout_out",
+                   help="Diretório de saída (padrão: mapscout_out)")
+    p.add_argument("--workers",  type=int, default=20, help="Workers paralelos (padrão: 20)")
+    p.add_argument("--timeout",  type=int, default=8,  help="Timeout HTTP em segundos (padrão: 8)")
+    p.add_argument("--quiet",    action="store_true",  help="Menos output no terminal")
     return p.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main() -> None:
-    args = parse_args()
-
-    # Diretório de saída
-    out_dir = Path(args.output_dir) if args.output_dir else Path("mapscout_out")
+    args    = parse_args()
+    out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    logger  = setup_logging(out_dir / "mapscout.log", quiet=args.quiet)
 
-    log_file = out_dir / "mapscout.log"
-    logger   = setup_logging(log_file)
-
-    if args.quiet:
-        logging.getLogger("mapscout").setLevel(logging.WARNING)
-
-    # Label do alvo para relatórios
-    domain_label = args.live or (Path(args.file).stem if args.file else "stdin")
-
-    logger.info("=" * 56)
-    logger.info("mapscout — %s", domain_label)
-    logger.info("Saída: %s", out_dir)
-    logger.info("=" * 56)
-
-    # ── 1. Lê/coleta URLs de JS ───────────────────────────────────────────────
-    js_urls = read_js_urls(args, logger)
-
-    # ── 2. Verifica .map ──────────────────────────────────────────────────────
-    findings = check_all(js_urls, workers=args.workers, timeout=args.timeout, logger=logger)
-
-    # ── 3. Relatórios ─────────────────────────────────────────────────────────
-    logger.info("=" * 56)
-    if findings:
-        logger.warning("Source maps expostos encontrados: %d", len(findings))
-
-        # Agrupa por domínio para resumo no terminal
-        by_domain: dict[str, int] = {}
-        for f in findings:
-            by_domain[f["domain"]] = by_domain.get(f["domain"], 0) + 1
-        for domain, count in sorted(by_domain.items(), key=lambda x: -x[1]):
-            logger.warning("  %-40s %d map(s)", domain, count)
-
-        if not args.no_txt:
-            write_txt(findings, out_dir / "maps_exposed.txt", logger)
-        if not args.no_jsonl:
-            write_jsonl(findings, out_dir / "maps_exposed.jsonl", logger)
-        if args.html:
-            write_html(findings, out_dir / "maps_exposed.html", domain_label, logger)
+    # Lê URLs JS
+    urls: list[str] = []
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            logger.error("Arquivo não encontrado: %s", args.file)
+            sys.exit(1)
+        raw  = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        urls = [l.strip() for l in raw if l.strip().startswith("http")]
+        logger.info("URLs lidas do arquivo: %d", len(urls))
+    elif not sys.stdin.isatty():
+        raw  = sys.stdin.read().splitlines()
+        urls = [l.strip() for l in raw if l.strip().startswith("http")]
+        logger.info("URLs lidas do stdin: %d", len(urls))
     else:
-        logger.info("Nenhum source map exposto encontrado.")
+        logger.error("Forneça -f FILE ou pipe via stdin.")
+        sys.exit(1)
 
-    logger.info("Verificados: %d JS  |  Expostos: %d maps", len(js_urls), len(findings))
-    logger.info("Log: %s", log_file)
-    logger.info("=" * 56)
+    # Subdomínios extras (opcional)
+    extra_hosts: set[str] = set()
+    if args.domains:
+        dp = Path(args.domains)
+        if dp.exists():
+            extra_hosts = {
+                l.strip().lower() for l in dp.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if l.strip()
+            }
+            logger.info("Subdomínios válidos carregados: %d", len(extra_hosts))
+
+    run(
+        js_urls=urls,
+        root_domain=args.domain,
+        out_dir=out_dir,
+        extra_hosts=extra_hosts,
+        workers=args.workers,
+        timeout=args.timeout,
+        logger=logger,
+    )
 
 
 if __name__ == "__main__":
