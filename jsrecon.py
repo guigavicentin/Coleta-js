@@ -7,14 +7,17 @@ Fluxo:
   2. Scan rápido de portas HTTP/HTTPS com nmap
   3. Validação de hosts ativos com httpx  (domínio + subdomínios + portas)
   4. Coleta de JS ao vivo via browser real  (Playwright / Chromium)
-  5. Deduplicação global de arquivos JS
-  6. Análise de JS:
+  5. Filtragem: mantém APENAS JS cujo host pertence ao target
+       (host == dominio.alvo  OU  host termina com .dominio.alvo)
+  6. Deduplicação global de arquivos JS
+  7. Análise de JS (somente arquivos do target):
        • Segredos / credenciais (40+ padrões, entropia, anti-FP)
        • Detecção de ofuscação por char-code arrays
        • Validação estrutural de JWT
        • Extração rica de endpoints (GET / POST / PUT / DELETE / PATCH / WS)
        • Query strings e parâmetros GET/POST
-  7. Relatório consolidado  (TXT + JSONL + HTML interativo filtrável)
+  8. mapscout  — detecção de source maps expostos (*.js.map reais)
+  9. Relatório consolidado  (TXT + JSONL + HTML interativo filtrável)
 
 Dependências Python:
     pip install playwright requests tenacity
@@ -79,7 +82,7 @@ HTTP_PORTS = [
 NMAP_PORTS = ",".join(str(p) for p in sorted(set(HTTP_PORTS)))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CDN — ignorar JS de terceiros de CDN pública
+# CDN — lista de domínios de CDN pública conhecidos (pré-filtro rápido)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CDN_RE = re.compile(
@@ -92,11 +95,72 @@ _CDN_RE = re.compile(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Filtro de domínio alvo  ← NOVO  ← NOVO  ← NOVO
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_target_filter(root_domain: str, confirmed_hosts: set[str]) -> callable:
+    """
+    Retorna uma função que aceita uma URL e indica se ela pertence ao target.
+
+    Regras (qualquer uma basta):
+      1. host == root_domain                  → ifood.com.br
+      2. host termina com .root_domain        → api.ifood.com.br
+      3. host está em confirmed_hosts         → hosts confirmados pelo httpx
+    """
+    root = root_domain.lower().lstrip("*.")
+
+    def _ok(url: str) -> bool:
+        try:
+            host = urlparse(url).netloc.lower().split(":")[0]
+        except Exception:
+            return False
+        if host == root:
+            return True
+        if host.endswith(f".{root}"):
+            return True
+        if host in confirmed_hosts:
+            return True
+        return False
+
+    return _ok
+
+
+def filter_target_js(
+    js_urls: set[str],
+    root_domain: str,
+    confirmed_hosts: set[str],
+    logger: logging.Logger,
+) -> set[str]:
+    """
+    Filtra URLs de JS, mantendo APENAS as que pertencem ao target.
+    Loga estatísticas de descarte.
+    """
+    is_target = _build_target_filter(root_domain, confirmed_hosts)
+    kept: set[str] = set()
+    dropped: list[str] = []
+
+    for url in js_urls:
+        if is_target(url):
+            kept.add(url)
+        else:
+            dropped.append(url)
+
+    logger.info(
+        "Filtro de target: %d JS mantidos / %d descartados (terceiros / fora do escopo)",
+        len(kept), len(dropped),
+    )
+    if dropped:
+        logger.debug("Exemplos descartados: %s", dropped[:5])
+
+    return kept
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Qualidade / anti-falso-positivo
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MIN_VALUE_LEN       = 8
-_MIN_ENTROPY         = 3.2
+_MIN_VALUE_LEN   = 8
+_MIN_ENTROPY     = 3.2
 _DECODED_ENTROPY_MIN = 3.5
 
 _PLACEHOLDER_RE = re.compile(
@@ -120,51 +184,51 @@ _UI_CONTEXT_RE = re.compile(
 # ─────────────────────────────────────────────────────────────────────────────
 
 SECRET_SEVERITY: dict[str, str] = {
-    "aws_access_key":        "CRITICAL",
-    "private_key":           "CRITICAL",
-    "stripe_secret":         "CRITICAL",
-    "braintree_token":       "CRITICAL",
-    "gcp_service_account":   "CRITICAL",
-    "hashicorp_vault":       "CRITICAL",
-    "azure_storage_key":     "CRITICAL",
-    "github_pat":            "HIGH",
-    "github_oauth":          "HIGH",
-    "gitlab_pat":            "HIGH",
-    "openai_key":            "HIGH",
-    "sendgrid_key":          "HIGH",
-    "slack_token":           "HIGH",
-    "supabase_service_role": "HIGH",
-    "mongodb_dsn":           "HIGH",
-    "postgres_dsn":          "HIGH",
-    "mysql_dsn":             "HIGH",
-    "google_api_key":        "HIGH",
-    "firebase_url":          "HIGH",
-    "twilio_auth_token":     "HIGH",
-    "jwt":                   "MEDIUM",
-    "stripe_publishable":    "MEDIUM",
-    "slack_webhook":         "MEDIUM",
-    "sentry_dsn":            "MEDIUM",
-    "mapbox_token":          "MEDIUM",
-    "supabase_anon_key":     "MEDIUM",
-    "mailgun_api_key":       "MEDIUM",
-    "generic_api_key":       "LOW",
-    "generic_token":         "LOW",
-    "generic_secret":        "LOW",
-    "bearer_token":          "LOW",
-    "password_field":        "LOW",
-    "bcrypt_hash":           "LOW",
-    "basic_auth_hardcoded":  "HIGH",
-    "basic_auth_btoa":       "HIGH",
-    "basic_auth_b64_raw":    "HIGH",
-    "hardcoded_credentials": "HIGH",
-    "auth_header_hardcoded": "MEDIUM",
-    "btoa_decoded":          "HIGH",
-    "btoa_creds":            "HIGH",
-    "js_secret_key":         "CRITICAL",
-    "firebase_app_id":       "HIGH",
-    "firebase_sender_id":    "MEDIUM",
+    "aws_access_key":          "CRITICAL",
+    "private_key":             "CRITICAL",
+    "stripe_secret":           "CRITICAL",
+    "braintree_token":         "CRITICAL",
+    "gcp_service_account":     "CRITICAL",
+    "hashicorp_vault":         "CRITICAL",
+    "azure_storage_key":       "CRITICAL",
+    "github_pat":              "HIGH",
+    "github_oauth":            "HIGH",
+    "gitlab_pat":              "HIGH",
+    "openai_key":              "HIGH",
+    "sendgrid_key":            "HIGH",
+    "slack_token":             "HIGH",
+    "supabase_service_role":   "HIGH",
+    "mongodb_dsn":             "HIGH",
+    "postgres_dsn":            "HIGH",
+    "mysql_dsn":               "HIGH",
+    "google_api_key":          "HIGH",
+    "firebase_url":            "HIGH",
+    "twilio_auth_token":       "HIGH",
+    "basic_auth_hardcoded":    "HIGH",
+    "basic_auth_btoa":         "HIGH",
+    "basic_auth_b64_raw":      "HIGH",
+    "hardcoded_credentials":   "HIGH",
+    "btoa_decoded":            "HIGH",
+    "btoa_creds":              "HIGH",
+    "js_secret_key":           "CRITICAL",
+    "firebase_app_id":         "HIGH",
+    "jwt":                     "MEDIUM",
+    "stripe_publishable":      "MEDIUM",
+    "slack_webhook":           "MEDIUM",
+    "sentry_dsn":              "MEDIUM",
+    "mapbox_token":            "MEDIUM",
+    "supabase_anon_key":       "MEDIUM",
+    "mailgun_api_key":         "MEDIUM",
+    "auth_header_hardcoded":   "MEDIUM",
+    "firebase_sender_id":      "MEDIUM",
     "firebase_measurement_id": "LOW",
-    "firebase_config_block": "HIGH",
+    "firebase_config_block":   "HIGH",
+    "generic_api_key":         "LOW",
+    "generic_token":           "LOW",
+    "generic_secret":          "LOW",
+    "bearer_token":            "LOW",
+    "password_field":          "LOW",
+    "bcrypt_hash":             "LOW",
 }
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
 
@@ -287,87 +351,73 @@ def setup_logging(log_file: Path) -> logging.Logger:
 
 def _secret_patterns() -> dict[str, re.Pattern]:
     return {
-        "google_api_key":        _rx(r'AIza[0-9A-Za-z\-_]{35}'),
-        "google_oauth_client":   _rx(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
-        "firebase_url":          _rx(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
-        # ── Configurações de ambiente / Firebase / chaves de app ─────────────
-        # secretKey / secreteKey hardcoded em objeto de config JS
-        "js_secret_key":         _rx(r'secrete?[Kk]ey\s*[:=]\s*["\']([^"\']{6,})["\']', re.I),
-        # Firebase appId no formato "1:NNNN:web:HEX"
-        "firebase_app_id":       _rx(r'appId\s*[:=]\s*["\'](\d+:\d+:\w+:[a-f0-9]{16,})["\']', re.I),
-        # Firebase messagingSenderId
-        "firebase_sender_id":    _rx(r'messagingSenderId\s*[:=]\s*["\'](\d{8,})["\']', re.I),
-        # Firebase measurementId / Google Analytics
+        "google_api_key":          _rx(r'AIza[0-9A-Za-z\-_]{35}'),
+        "google_oauth_client":     _rx(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
+        "firebase_url":            _rx(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
+        "js_secret_key":           _rx(r'secrete?[Kk]ey\s*[:=]\s*["\']([^"\']{6,})["\']', re.I),
+        "firebase_app_id":         _rx(r'appId\s*[:=]\s*["\'](\d+:\d+:\w+:[a-f0-9]{16,})["\']', re.I),
+        "firebase_sender_id":      _rx(r'messagingSenderId\s*[:=]\s*["\'](\d{8,})["\']', re.I),
         "firebase_measurement_id": _rx(r'measurementId\s*[:=]\s*["\']([A-Z0-9\-]{8,})["\']', re.I),
-        # Bloco de config Firebase completo (apiKey + authDomain juntos)
-        "firebase_config_block": _rx(r'apiKey\s*:\s*["\']([^"\']{20,})["\'][^}]{0,200}authDomain\s*:\s*["\']([^"\']+)["\']', re.I | re.DOTALL),
-        # environment.ts / config.js: chaves de ambiente genéricas minificadas
-        "env_config_key":        _rx(r'(?:apiUrl|baseUrl|endpointUrl|serviceUrl|backendUrl)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
-        "gcp_service_account":   _rx(r'"type"\s*:\s*"service_account"'),
-        "aws_access_key":        _rx(r'AKIA[0-9A-Z]{16}'),
-        "amazon_mws":            _rx(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
-        "azure_storage_key":     _rx(r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}'),
-        "digitalocean_token":    _rx(r'dop_v1_[a-f0-9]{64}'),
-        "stripe_secret":         _rx(r'sk_live_[0-9a-zA-Z]{24,}'),
-        "stripe_publishable":    _rx(r'pk_live_[0-9a-zA-Z]{24,}'),
-        "stripe_webhook":        _rx(r'whsec_[a-zA-Z0-9]{32,}'),
-        "braintree_token":       _rx(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
-        "sendgrid_key":          _rx(r'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'),
-        "mailgun_api_key":       _rx(r'key-[0-9a-zA-Z]{32}'),
-        "mailchimp_api_key":     _rx(r'[0-9a-f]{32}-us[0-9]{1,2}'),
-        "twilio_account_sid":    _rx(r'\bAC[a-z0-9]{32}\b'),
-        "twilio_auth_token":     _rx(r'\bSK[a-z0-9]{32}\b'),
-        "github_pat":            _rx(r'gh[pousr]_[A-Za-z0-9]{36}'),
-        "github_oauth":          _rx(r'gho_[A-Za-z0-9]{36}'),
-        "gitlab_pat":            _rx(r'glpat-[A-Za-z0-9\-_]{20}'),
-        "gitlab_pipeline":       _rx(r'glptt-[a-f0-9]{40}'),
-        "npm_token":             _rx(r'npm_[A-Za-z0-9]{36}'),
-        "pypi_token":            _rx(r'pypi-[A-Za-z0-9_\-]{50,}'),
-        "dockerhub_pat":         _rx(r'dckr_pat_[A-Za-z0-9_\-]{27}'),
-        "hashicorp_vault":       _rx(r'hvs\.[A-Za-z0-9_\-]{90,}'),
-        "new_relic_key":         _rx(r'NRAK-[A-Z0-9]{27}'),
-        "sentry_dsn":            _rx(r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+'),
-        "grafana_token":         _rx(r'glc_[A-Za-z0-9+/]{32,}'),
-        "openai_key":            _rx(r'sk-[a-zA-Z0-9]{48}'),
-        "slack_token":           _rx(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
-        "slack_webhook":         _rx(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
-        "mongodb_dsn":           _rx(r'mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-        "postgres_dsn":          _rx(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-        "mysql_dsn":             _rx(r'mysql://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
-        "redis_dsn":             _rx(r'redis://:([^@\s]+)@[^\s"\'`]+', re.I),
-        "shopify_token":         _rx(r'shp(?:at|ss)_[a-fA-F0-9]{32}'),
-        "mapbox_token":          _rx(r'pk\.eyJ1[A-Za-z0-9._\-]{20,}'),
-        "notion_token":          _rx(r'secret_[A-Za-z0-9]{43}'),
-        "linear_api_key":        _rx(r'lin_api_[A-Za-z0-9]{40}'),
-        "supabase_url":          _rx(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
-        "supabase_anon_key":     _rx(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
-        "supabase_service_role": _rx(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
-        "private_key":           _rx(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
-        "jwt":                   _rx(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
-        "bcrypt_hash":           _rx(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
-        "generic_api_key":       _rx(r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
-        "generic_token":         _rx(r'(?:access[_-]?token|auth[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', re.I),
-        "generic_secret":        _rx(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
-        "bearer_token":          _rx(r'Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]{20,})', re.I),
-        "password_field":        _rx(r'(?:password|passwd|senha)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
-        # ── Basic Auth / credenciais hardcoded ──────────────────────────────
-        # Caso: Authorization:"Basic "+btoa("admin:123456") — Angular/React/Vue
-        "basic_auth_btoa":       _rx(r'Basic\s*["\']?\s*\+\s*btoa\s*\(\s*["\']([^"\']{3,100})["\']\s*\)', re.I),
-        # btoa("user:pass") standalone — decodificável via base64
-        "btoa_creds":            _rx(r'\bbtoa\s*\(\s*["\']([^"\']{2,100})["\']\s*\)', re.I),
-        # Authorization: "Basic dXNlcjpwYXNz" — base64 literal já embutido
-        "basic_auth_b64_raw":    _rx(r'(?:Authorization|authorization)\s*[:\s=]+["\']?\s*Basic\s+([A-Za-z0-9+/]{8,}={0,2})', re.I),
-        # username + password juntos na mesma região do código
-        "hardcoded_credentials": _rx(r'(?:username|user|login|usr)\s*[:=]\s*["\']([^"\']{2,50})["\']\s{0,5}.{0,80}(?:password|passwd|pass|pwd|senha)\s*[:=]\s*["\']([^"\']{2,})["\']', re.I),
-        # Authorization como chave de objeto JS com valor Basic
-        "auth_header_hardcoded": _rx(r'["\']Authorization["\']\s*:\s*["\']Basic\s+([A-Za-z0-9+/]{8,}={0,2})["\']', re.I),
+        "firebase_config_block":   _rx(r'apiKey\s*:\s*["\']([^"\']{20,})["\'][^}]{0,200}authDomain\s*:\s*["\']([^"\']+)["\']', re.I | re.DOTALL),
+        "env_config_key":          _rx(r'(?:apiUrl|baseUrl|endpointUrl|serviceUrl|backendUrl)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+        "gcp_service_account":     _rx(r'"type"\s*:\s*"service_account"'),
+        "aws_access_key":          _rx(r'AKIA[0-9A-Z]{16}'),
+        "amazon_mws":              _rx(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
+        "azure_storage_key":       _rx(r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}'),
+        "digitalocean_token":      _rx(r'dop_v1_[a-f0-9]{64}'),
+        "stripe_secret":           _rx(r'sk_live_[0-9a-zA-Z]{24,}'),
+        "stripe_publishable":      _rx(r'pk_live_[0-9a-zA-Z]{24,}'),
+        "stripe_webhook":          _rx(r'whsec_[a-zA-Z0-9]{32,}'),
+        "braintree_token":         _rx(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),
+        "sendgrid_key":            _rx(r'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'),
+        "mailgun_api_key":         _rx(r'key-[0-9a-zA-Z]{32}'),
+        "mailchimp_api_key":       _rx(r'[0-9a-f]{32}-us[0-9]{1,2}'),
+        "twilio_account_sid":      _rx(r'\bAC[a-z0-9]{32}\b'),
+        "twilio_auth_token":       _rx(r'\bSK[a-z0-9]{32}\b'),
+        "github_pat":              _rx(r'gh[pousr]_[A-Za-z0-9]{36}'),
+        "github_oauth":            _rx(r'gho_[A-Za-z0-9]{36}'),
+        "gitlab_pat":              _rx(r'glpat-[A-Za-z0-9\-_]{20}'),
+        "gitlab_pipeline":         _rx(r'glptt-[a-f0-9]{40}'),
+        "npm_token":               _rx(r'npm_[A-Za-z0-9]{36}'),
+        "pypi_token":              _rx(r'pypi-[A-Za-z0-9_\-]{50,}'),
+        "dockerhub_pat":           _rx(r'dckr_pat_[A-Za-z0-9_\-]{27}'),
+        "hashicorp_vault":         _rx(r'hvs\.[A-Za-z0-9_\-]{90,}'),
+        "new_relic_key":           _rx(r'NRAK-[A-Z0-9]{27}'),
+        "sentry_dsn":              _rx(r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+'),
+        "grafana_token":           _rx(r'glc_[A-Za-z0-9+/]{32,}'),
+        "openai_key":              _rx(r'sk-[a-zA-Z0-9]{48}'),
+        "slack_token":             _rx(r'xox[baprs]-[0-9a-zA-Z\-]{10,48}'),
+        "slack_webhook":           _rx(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'),
+        "mongodb_dsn":             _rx(r'mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
+        "postgres_dsn":            _rx(r'postgres(?:ql)?://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
+        "mysql_dsn":               _rx(r'mysql://[^:\s]+:[^@\s]+@[^\s"\'`]+', re.I),
+        "redis_dsn":               _rx(r'redis://:([^@\s]+)@[^\s"\'`]+', re.I),
+        "shopify_token":           _rx(r'shp(?:at|ss)_[a-fA-F0-9]{32}'),
+        "mapbox_token":            _rx(r'pk\.eyJ1[A-Za-z0-9._\-]{20,}'),
+        "notion_token":            _rx(r'secret_[A-Za-z0-9]{43}'),
+        "linear_api_key":          _rx(r'lin_api_[A-Za-z0-9]{40}'),
+        "supabase_url":            _rx(r'https://[a-z0-9]{20}\.supabase\.co', re.I),
+        "supabase_anon_key":       _rx(r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{43}'),
+        "supabase_service_role":   _rx(r'(?:SUPABASE_SERVICE_ROLE_KEY|service_role)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{100,})["\']', re.I),
+        "private_key":             _rx(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+        "jwt":                     _rx(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
+        "bcrypt_hash":             _rx(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'),
+        "generic_api_key":         _rx(r'(?:api[_-]?key|apikey)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+        "generic_token":           _rx(r'(?:access[_-]?token|auth[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']', re.I),
+        "generic_secret":          _rx(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
+        "bearer_token":            _rx(r'Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]{20,})', re.I),
+        "password_field":          _rx(r'(?:password|passwd|senha)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+        "basic_auth_btoa":         _rx(r'Basic\s*["\']?\s*\+\s*btoa\s*\(\s*["\']([^"\']{3,100})["\']\s*\)', re.I),
+        "btoa_creds":              _rx(r'\bbtoa\s*\(\s*["\']([^"\']{2,100})["\']\s*\)', re.I),
+        "basic_auth_b64_raw":      _rx(r'(?:Authorization|authorization)\s*[:\s=]+["\']?\s*Basic\s+([A-Za-z0-9+/]{8,}={0,2})', re.I),
+        "hardcoded_credentials":   _rx(r'(?:username|user|login|usr)\s*[:=]\s*["\']([^"\']{2,50})["\']\s{0,5}.{0,80}(?:password|passwd|pass|pwd|senha)\s*[:=]\s*["\']([^"\']{2,})["\']', re.I),
+        "auth_header_hardcoded":   _rx(r'["\']Authorization["\']\s*:\s*["\']Basic\s+([A-Za-z0-9+/]{8,}={0,2})["\']', re.I),
     }
 
 
 _GENERIC_PATTERNS = frozenset({
     "generic_api_key", "generic_token", "generic_secret",
-    "bearer_token", "password_field",
-    "auth_header_hardcoded",
+    "bearer_token", "password_field", "auth_header_hardcoded",
 })
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,42 +425,24 @@ _GENERIC_PATTERNS = frozenset({
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
-    """(label, regex, method_hint). DYNAMIC = método capturado do grupo 2."""
     return [
-        ("api_versioned",
-         _rx(r'["\`](/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s"\'`]*)?)["\`]'), "ANY"),
-        ("graphql",
-         _rx(r'["\`]((?:/graphql|/gql)(?:\?[^\s"\'`]*)?)["\`\s/]', re.I), "POST"),
-        ("versioned_path",
-         _rx(r'["\`](/v\d+/[a-zA-Z0-9/_\-]{4,}(?:\?[^\s"\'`]*)?)["\`]'), "ANY"),
-        ("internal_subdomain",
-         _rx(r'(https?://(?:internal|admin|dev|staging|api)\.[a-z0-9\-]+\.[a-z]+[^\s"\'`]*)'), "ANY"),
-        ("fetch_get",
-         _rx(r'(?:fetch|axios\.get|http\.get|request\.get|this\.\$http\.get)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "GET"),
-        ("fetch_post",
-         _rx(r'(?:fetch|axios\.post|http\.post|request\.post|this\.\$http\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "POST"),
-        ("fetch_put",
-         _rx(r'(?:axios\.put|http\.put|request\.put)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "PUT"),
-        ("fetch_delete",
-         _rx(r'(?:axios\.delete|http\.delete|request\.delete)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "DELETE"),
-        ("fetch_patch",
-         _rx(r'(?:axios\.patch|http\.patch|request\.patch)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "PATCH"),
-        ("fetch_dynamic",
-         _rx(r'fetch\s*\(\s*["\`]([^"\'`\s]{4,})["\`]\s*,\s*\{[^}]*method\s*:\s*["\'](\w+)["\']', re.I), "DYNAMIC"),
-        ("query_string_get",
-         _rx(r'(?:new\s+URLSearchParams|qs\.stringify|querystring\.stringify)\s*\([^)]*\).*?["\`](/[a-zA-Z0-9/_\-]{2,})["\`]', re.I | re.DOTALL), "GET"),
-        ("json_body_post",
-         _rx(r'body\s*:\s*JSON\.stringify\s*\([^)]*\).*?["\`](/[a-zA-Z0-9/_\-]{2,})["\`]', re.I | re.DOTALL), "POST"),
-        ("formdata_post",
-         _rx(r'new\s+FormData\s*\([^)]*\).*?(?:fetch|axios\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I | re.DOTALL), "POST"),
-        ("router_path",
-         _rx(r'(?:path|route|to)\s*:\s*["\`](/[a-zA-Z0-9/_\-:]{3,}(?:\?[^\s"\'`]*)?)["\`]', re.I), "GET"),
-        ("href_path",
-         _rx(r'(?:href|src|action)\s*[=:]\s*["\`](/[a-zA-Z0-9/_\-\.]{4,}(?:\?[^\s"\'`]*)?)["\`]', re.I), "GET"),
-        ("url_with_query",
-         _rx(r'["\`]((?:https?://[^\s"\'`]+)?/[a-zA-Z0-9/_\-]{2,}\?(?:[a-zA-Z0-9_\-]+=\w+&?)+)["\`]', re.I), "GET"),
-        ("websocket",
-         _rx(r'new\s+WebSocket\s*\(\s*["\`](wss?://[^\s"\'`]+)["\`]', re.I), "WS"),
+        ("api_versioned",      _rx(r'["\`](/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s"\'`]*)?)["\`]'), "ANY"),
+        ("graphql",            _rx(r'["\`]((?:/graphql|/gql)(?:\?[^\s"\'`]*)?)["\`\s/]', re.I), "POST"),
+        ("versioned_path",     _rx(r'["\`](/v\d+/[a-zA-Z0-9/_\-]{4,}(?:\?[^\s"\'`]*)?)["\`]'), "ANY"),
+        ("internal_subdomain", _rx(r'(https?://(?:internal|admin|dev|staging|api)\.[a-z0-9\-]+\.[a-z]+[^\s"\'`]*)'), "ANY"),
+        ("fetch_get",          _rx(r'(?:fetch|axios\.get|http\.get|request\.get|this\.\$http\.get)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "GET"),
+        ("fetch_post",         _rx(r'(?:fetch|axios\.post|http\.post|request\.post|this\.\$http\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "POST"),
+        ("fetch_put",          _rx(r'(?:axios\.put|http\.put|request\.put)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "PUT"),
+        ("fetch_delete",       _rx(r'(?:axios\.delete|http\.delete|request\.delete)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "DELETE"),
+        ("fetch_patch",        _rx(r'(?:axios\.patch|http\.patch|request\.patch)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I), "PATCH"),
+        ("fetch_dynamic",      _rx(r'fetch\s*\(\s*["\`]([^"\'`\s]{4,})["\`]\s*,\s*\{[^}]*method\s*:\s*["\'](\w+)["\']', re.I), "DYNAMIC"),
+        ("query_string_get",   _rx(r'(?:new\s+URLSearchParams|qs\.stringify|querystring\.stringify)\s*\([^)]*\).*?["\`](/[a-zA-Z0-9/_\-]{2,})["\`]', re.I | re.DOTALL), "GET"),
+        ("json_body_post",     _rx(r'body\s*:\s*JSON\.stringify\s*\([^)]*\).*?["\`](/[a-zA-Z0-9/_\-]{2,})["\`]', re.I | re.DOTALL), "POST"),
+        ("formdata_post",      _rx(r'new\s+FormData\s*\([^)]*\).*?(?:fetch|axios\.post)\s*\(\s*["\`]([^"\'`\s]{4,})["\`]', re.I | re.DOTALL), "POST"),
+        ("router_path",        _rx(r'(?:path|route|to)\s*:\s*["\`](/[a-zA-Z0-9/_\-:]{3,}(?:\?[^\s"\'`]*)?)["\`]', re.I), "GET"),
+        ("href_path",          _rx(r'(?:href|src|action)\s*[=:]\s*["\`](/[a-zA-Z0-9/_\-\.]{4,}(?:\?[^\s"\'`]*)?)["\`]', re.I), "GET"),
+        ("url_with_query",     _rx(r'["\`]((?:https?://[^\s"\'`]+)?/[a-zA-Z0-9/_\-]{2,}\?(?:[a-zA-Z0-9_\-]+=\w+&?)+)["\`]', re.I), "GET"),
+        ("websocket",          _rx(r'new\s+WebSocket\s*\(\s*["\`](wss?://[^\s"\'`]+)["\`]', re.I), "WS"),
     ]
 
 
@@ -464,20 +496,20 @@ def scan_obfuscation(content: str, url: str, logger: logging.Logger) -> list[dic
 # Estado global thread-safe
 # ─────────────────────────────────────────────────────────────────────────────
 
-_analyzed_js:    set[str]           = set()
-_analyzed_lock:  threading.Lock     = threading.Lock()
-_seen_secrets:   set[tuple]         = set()
-_secrets_lock:   threading.Lock     = threading.Lock()
-_secret_write:   threading.Lock     = threading.Lock()
-_seen_endpoints: set[tuple]         = set()
-_endpoint_write: threading.Lock     = threading.Lock()
+_analyzed_js:    set[str]       = set()
+_analyzed_lock:  threading.Lock = threading.Lock()
+_seen_secrets:   set[tuple]     = set()
+_secrets_lock:   threading.Lock = threading.Lock()
+_secret_write:   threading.Lock = threading.Lock()
+_seen_endpoints: set[tuple]     = set()
+_endpoint_write: threading.Lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Escrita de arquivos
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _write(path: Path, lines: list[str], logger: logging.Logger) -> bool:
-    content = [l for l in lines if l.strip()]
+def _write(path: Path, lines, logger: logging.Logger) -> bool:
+    content = [str(l) for l in lines if str(l).strip()]
     if not content:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -655,7 +687,7 @@ def analyze_js(content: str, url: str, cfg: dict, logger: logging.Logger) -> int
             if name == "jwt" and not _is_real_jwt(value):
                 continue
 
-            ctx     = content[max(0, m.start()-90):min(len(content), m.end()+90)].replace("\r"," ").replace("\n"," ")
+            ctx     = content[max(0, m.start()-90):min(len(content), m.end()+90)].replace("\r", " ").replace("\n", " ")
             finding = {"type": name, "value": value, "url": url, "context": ctx}
             if _save_secret(finding, cfg):
                 logger.warning("[!!!] %s → %s | %s", name, value[:80], url)
@@ -666,20 +698,13 @@ def analyze_js(content: str, url: str, cfg: dict, logger: logging.Logger) -> int
         _save_secret(obf, cfg)
         found += 1
 
-    # ── Decodificação de btoa() ──────────────────────────────────────────────
-    # Qualquer btoa("...") encontrado: decodifica e anota o valor em claro
+    # ── btoa() ────────────────────────────────────────────────────────────────
     _btoa_re = re.compile(r'\bbtoa\s*\(\s*["\'](.*?)["\'\']\s*\)', re.I)
     for bm in _btoa_re.finditer(content):
-        raw_val = bm.group(1)          # ex: "admin:123456"
+        raw_val = bm.group(1)
         ctx     = content[max(0, bm.start()-80):min(len(content), bm.end()+80)].replace("\n", " ")
-        finding = {
-            "type":    "btoa_decoded",
-            "value":   raw_val,
-            "url":     url,
-            "context": ctx,
-        }
+        finding = {"type": "btoa_decoded", "value": raw_val, "url": url, "context": ctx}
         if _save_secret(finding, cfg):
-            # Tenta decodificar se já for base64 (às vezes o btoa já foi avaliado)
             decoded = ""
             try:
                 import base64 as _b64mod
@@ -735,7 +760,6 @@ def process_js_url(url: str, cfg: dict, logger: logging.Logger, get_fn) -> int:
             return 0
         _analyzed_js.add(key)
 
-    # Cache em disco
     cache_file = cfg["cache_dir"] / (hashlib.sha1(key.encode()).hexdigest()[:16] + ".json")
     if cache_file.exists() and not cfg.get("no_cache"):
         try:
@@ -757,7 +781,6 @@ def process_js_url(url: str, cfg: dict, logger: logging.Logger, get_fn) -> int:
     if not is_js(resp, content):
         return 0
 
-    # Salva cache
     if not cfg.get("no_cache"):
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -774,7 +797,7 @@ def analyze_js_list(js_urls: list[str], cfg: dict, logger: logging.Logger) -> in
         return 0
     total  = 0
     get_fn = _make_get(cfg)
-    logger.info("Analisando %d arquivos JS…", len(js_urls))
+    logger.info("Analisando %d arquivos JS do target…", len(js_urls))
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
         futs = {ex.submit(process_js_url, u, cfg, logger, get_fn): u for u in js_urls}
         for fut in as_completed(futs):
@@ -835,7 +858,7 @@ async def _playwright_crawl(url: str, timeout_s: int, wait_s: int,
 
 async def live_crawl_all(targets: list[str], cfg: dict,
                           logger: logging.Logger) -> set[str]:
-    """Roda o Playwright em cada alvo e retorna set de URLs de JS únicas."""
+    """Roda o Playwright em cada alvo e retorna set de URLs de JS brutas (sem filtro de domínio)."""
     all_js: set[str] = set()
     total = len(targets)
     for idx, url in enumerate(targets, 1):
@@ -847,13 +870,14 @@ async def live_crawl_all(targets: list[str], cfg: dict,
             )
             for f in files:
                 js_url = f["url"]
+                # Filtro de CDN apenas (filtro de domínio é feito depois)
                 if not _CDN_RE.search(js_url):
                     all_js.add(js_url)
-            logger.info("  → %d JS capturados", len(files))
+            logger.info("  → %d JS capturados (bruto, pré-filtro)", len(files))
         except Exception as e:
             logger.error("  [browser] erro em %s: %s", url, e)
 
-    logger.info("[live-crawler] total de JS ao vivo (bruto): %d", len(all_js))
+    logger.info("[live-crawler] total de JS bruto (pré-filtro de domínio): %d", len(all_js))
     return all_js
 
 
@@ -869,17 +893,6 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
     chaos_key    = os.environ.get("CHAOS_KEY", "").strip()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
 
-    if chaos_key:
-        logger.info("[chaos] CHAOS_KEY presente ✓")
-    else:
-        logger.warning("[chaos] CHAOS_KEY não definida — export CHAOS_KEY='sua_chave'")
-
-    if github_token:
-        logger.info("[github-subdomains] GITHUB_TOKEN presente ✓")
-    else:
-        logger.warning("[github-subdomains] GITHUB_TOKEN não definido — export GITHUB_TOKEN='seu_token'")
-
-    # subfinder
     if tool_ok("subfinder"):
         logger.info("[subfinder] …")
         lines = run_cmd(["subfinder", "-d", domain, "-silent"], logger, timeout=300)
@@ -888,7 +901,6 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
     else:
         logger.warning("subfinder não encontrado  |  go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
 
-    # assetfinder
     if tool_ok("assetfinder"):
         logger.info("[assetfinder] …")
         lines = run_cmd(["assetfinder", "--subs-only", domain], logger, timeout=180)
@@ -897,37 +909,28 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
     else:
         logger.warning("assetfinder não encontrado  |  go install github.com/tomnomnom/assetfinder@latest")
 
-    # chaos — passa a chave explicitamente com -key
     if tool_ok("chaos"):
         if not chaos_key:
             logger.warning("[chaos] pulando — CHAOS_KEY não definida.")
         else:
             logger.info("[chaos] …")
-            lines = run_cmd(
-                ["chaos", "-d", domain, "-key", chaos_key, "-silent"],
-                logger, timeout=180,
-            )
+            lines = run_cmd(["chaos", "-d", domain, "-key", chaos_key, "-silent"], logger, timeout=180)
             subs.update(lines)
             logger.info("[chaos] %d subs", len(lines))
     else:
         logger.warning("chaos não encontrado  |  go install github.com/projectdiscovery/chaos-client/cmd/chaos@latest")
 
-    # github-subdomains — passa o token explicitamente com -t
     if tool_ok("github-subdomains"):
         if not github_token:
             logger.warning("[github-subdomains] pulando — GITHUB_TOKEN não definido.")
         else:
             logger.info("[github-subdomains] …")
-            lines = run_cmd(
-                ["github-subdomains", "-d", domain, "-t", github_token, "-raw"],
-                logger, timeout=120,
-            )
+            lines = run_cmd(["github-subdomains", "-d", domain, "-t", github_token, "-raw"], logger, timeout=120)
             subs.update(lines)
             logger.info("[github-subdomains] %d subs", len(lines))
     else:
         logger.warning("github-subdomains não encontrado  |  go install github.com/gwen001/github-subdomains@latest")
 
-    # Normaliza
     clean = {
         s.strip().lower() for s in subs
         if s.strip()
@@ -935,7 +938,7 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
         and domain in s
         and s.strip().lower() != domain
     }
-    clean.add(domain)   # inclui o domínio raiz
+    clean.add(domain)
 
     logger.info("Subdomínios únicos (total): %d", len(clean))
     _write(cfg["subs_file"], sorted(clean), logger)
@@ -943,13 +946,10 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 2 — Nmap nas portas HTTP/HTTPS
+# Etapa 2 — Nmap
 # ─────────────────────────────────────────────────────────────────────────────
 
 def nmap_scan(subs: set[str], cfg: dict, logger: logging.Logger) -> dict[str, list[int]]:
-    """
-    Retorna {host: [porta_aberta, ...]}
-    """
     if not tool_ok("nmap"):
         logger.warning("nmap não encontrado — pulando scan de portas  |  apt install nmap")
         return {s: [80, 443] for s in subs}
@@ -963,33 +963,28 @@ def nmap_scan(subs: set[str], cfg: dict, logger: logging.Logger) -> dict[str, li
     cmd = [
         "nmap", "-iL", str(hosts_file),
         "-p", NMAP_PORTS,
-        "--open",
-        "-T4",
+        "--open", "-T4",
         "--max-retries", "1",
         "--host-timeout", "30s",
         "-oN", str(nmap_out),
         "-n",
     ]
-    logger.info("[nmap] rodando (pode demorar alguns minutos)…")
+    logger.info("[nmap] rodando…")
     run_cmd(cmd, logger, timeout=1800)
 
-    # Parse do output normal do nmap
     open_ports: dict[str, list[int]] = {}
     if nmap_out.exists():
         current_host = None
         for line in nmap_out.read_text(encoding="utf-8", errors="ignore").splitlines():
             hm = re.match(r'^Nmap scan report for (.+)', line)
             if hm:
-                h = hm.group(1).strip()
-                # Remove "(IP)" se presente
-                h = re.sub(r'\s*\(.*?\)', '', h).strip()
+                h = re.sub(r'\s*\(.*?\)', '', hm.group(1)).strip()
                 current_host = h
                 open_ports.setdefault(current_host, [])
             pm = re.match(r'^(\d+)/tcp\s+open', line)
             if pm and current_host:
                 open_ports[current_host].append(int(pm.group(1)))
 
-    # Hosts sem portas abertas: atribui 80/443 como fallback
     for s in subs:
         if s not in open_ports:
             open_ports[s] = []
@@ -997,24 +992,24 @@ def nmap_scan(subs: set[str], cfg: dict, logger: logging.Logger) -> dict[str, li
     total_open = sum(len(v) for v in open_ports.values())
     logger.info("[nmap] portas abertas encontradas: %d", total_open)
 
-    # Salva resumo
     summary = [f"{h}: {','.join(map(str,ports)) or 'nenhuma'}"
                for h, ports in sorted(open_ports.items())]
     _write(cfg["out_dir"] / "nmap_summary.txt", summary, logger)
-
     return open_ports
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Etapa 3 — httpx: valida hosts ativos
+# Etapa 3 — httpx
 # ─────────────────────────────────────────────────────────────────────────────
 
-def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
-                logger: logging.Logger) -> list[str]:
+def httpx_probe(
+    open_ports: dict[str, list[int]],
+    cfg: dict,
+    logger: logging.Logger,
+) -> tuple[list[str], set[str]]:
     """
-    Monta URLs host:porta para cada porta aberta e valida com httpx.
-    Garante que 80 e 443 sempre sejam testados como fallback.
-    Retorna lista de URLs ativas.
+    Retorna (alive_urls, confirmed_hosts).
+    confirmed_hosts é o set de hostnames confirmados ativos — usado pelo filtro de JS.
     """
     logger.info("═══ httpx — validação de hosts ativos ═══")
 
@@ -1022,12 +1017,10 @@ def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
 
     candidates: set[str] = set()
     for host, ports in open_ports.items():
-        # Sempre testa 80 e 443 independente do nmap
         base_ports = set(ports) | {80, 443}
         for port in base_ports:
             scheme = "https" if port in HTTPS_PORTS else "http"
             candidates.add(f"{scheme}://{host}:{port}")
-            # Para porta 443 também testa sem porta explícita (SNI)
             if port == 443:
                 candidates.add(f"https://{host}")
             if port == 80:
@@ -1035,23 +1028,22 @@ def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
 
     if not candidates:
         logger.warning("Nenhum candidato para httpx.")
-        return []
-
-    logger.info("[httpx] testando %d candidatos…", len(candidates))
+        return [], set()
 
     if not tool_ok("httpx"):
         logger.warning("httpx não encontrado — usando candidatos sem validação  |  "
                        "go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
-        _write(cfg["alive_file"], candidates, logger)
-        return candidates
+        urls = sorted(candidates)
+        hosts = {urlparse(u).netloc.split(":")[0].lower() for u in urls}
+        _write(cfg["alive_file"], urls, logger)
+        return urls, hosts
 
     candidate_list = sorted(candidates)
     logger.info("[httpx] testando %d candidatos…", len(candidate_list))
 
     try:
         result = subprocess.run(
-            ["httpx",
-             "-silent",
+            ["httpx", "-silent",
              "-mc", "200,201,204,301,302,307,308,401,403",
              "-threads", "50",
              "-timeout", "8",
@@ -1059,8 +1051,8 @@ def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
             input="\n".join(candidate_list) + "\n",
             capture_output=True, text=True, timeout=600,
         )
-        # Sem -title/-status-code: cada linha é a URL limpa
-        urls_clean = [u.strip() for u in result.stdout.splitlines() if u.strip().startswith("http")]
+        urls_clean = [u.strip() for u in result.stdout.splitlines()
+                      if u.strip().startswith("http")]
     except subprocess.TimeoutExpired:
         logger.warning("Timeout no httpx — usando candidatos sem filtrar.")
         urls_clean = candidate_list
@@ -1068,39 +1060,88 @@ def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
         logger.error("Erro no httpx: %s", e)
         urls_clean = candidate_list
 
+    # Extrai hostnames confirmados
+    confirmed_hosts = {
+        urlparse(u).netloc.lower().split(":")[0]
+        for u in urls_clean
+    }
+
     _write(cfg["alive_file"], urls_clean, logger)
     logger.info("[httpx] hosts ativos: %d", len(urls_clean))
-    return urls_clean
+    logger.info("[httpx] hostnames confirmados: %d", len(confirmed_hosts))
+    return urls_clean, confirmed_hosts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Etapa 4 — Coleta de JS ao vivo (Playwright)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def collect_live_js(alive_urls: list[str], cfg: dict, logger: logging.Logger) -> set[str]:
+def collect_live_js(
+    alive_urls: list[str],
+    confirmed_hosts: set[str],
+    cfg: dict,
+    logger: logging.Logger,
+) -> set[str]:
     logger.info("═══ Coleta de JS ao vivo (browser) ═══")
 
-    # Deduplica targets: um por host:porta (evita repetir https://x.com:443 e https://x.com)
     seen_targets: set[str] = set()
     targets: list[str] = []
     for url in alive_urls:
         parsed = urlparse(url)
-        key    = f"{parsed.netloc}"
+        key    = parsed.netloc
         if key not in seen_targets:
             seen_targets.add(key)
-            # Usa só a raiz do host para o browser
             base = f"{parsed.scheme}://{parsed.netloc}"
             targets.append(base)
 
     logger.info("Alvos para browser: %d", len(targets))
-    js_urls = asyncio.run(live_crawl_all(targets, cfg, logger))
 
-    # Dedup final (remove CDN e .map)
-    js_clean = {u for u in js_urls if not u.endswith(".js.map") and not _CDN_RE.search(u)}
+    # Coleta bruta (todos os JS que o browser carregar)
+    js_raw = asyncio.run(live_crawl_all(targets, cfg, logger))
+
+    # ── FILTRO DE DOMÍNIO ─────────────────────────────────────────────────────
+    # Remove .map e aplica filtro: apenas JS do domínio alvo e subdomínios
+    js_no_maps = {u for u in js_raw if not u.endswith(".js.map")}
+    js_clean   = filter_target_js(js_no_maps, cfg["domain"], confirmed_hosts, logger)
 
     _write(cfg["js_urls_file"], sorted(js_clean), logger)
-    logger.info("JS únicos coletados ao vivo: %d → %s", len(js_clean), cfg["js_urls_file"])
+    logger.info(
+        "JS do target salvos: %d → %s",
+        len(js_clean), cfg["js_urls_file"],
+    )
     return js_clean
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etapa 5 — mapscout (chamado ao final)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_mapscout(
+    js_urls: set[str],
+    confirmed_hosts: set[str],
+    cfg: dict,
+    logger: logging.Logger,
+) -> int:
+    """Importa e executa o mapscout programaticamente."""
+    logger.info("═══ mapscout — source maps expostos ═══")
+    try:
+        import mapscout
+    except ImportError:
+        logger.error(
+            "mapscout.py não encontrado. Coloque mapscout.py no mesmo diretório que jsrecon.py."
+        )
+        return 0
+
+    findings = mapscout.run(
+        js_urls=sorted(js_urls),
+        root_domain=cfg["domain"],
+        out_dir=cfg["out_dir"],
+        extra_hosts=confirmed_hosts,
+        workers=cfg["workers"],
+        timeout=cfg["timeout"],
+        logger=logger,
+    )
+    return len(findings)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1112,28 +1153,29 @@ def make_cfg(domain: str, args: argparse.Namespace) -> dict:
     out.mkdir(exist_ok=True)
 
     return {
-        "domain":           domain,
-        "out_dir":          out,
-        "subs_file":        out / "subdomains.txt",
-        "alive_file":       out / "hosts_alive.txt",
-        "js_urls_file":     out / "js_urls.txt",
-        "secrets_txt":      out / "secrets.txt",
-        "secrets_csv":      out / "secrets.csv",
-        "secrets_jsonl":    out / "secrets.jsonl",
-        "endpoints_txt":    out / "endpoints.txt",
-        "endpoints_jsonl":  out / "endpoints.jsonl",
-        "summary_txt":      out / "SUMMARY.txt",
-        "summary_html":     out / "SUMMARY.html",
-        "log_file":         out / "jsrecon.log",
-        "cache_dir":        out / ".js_cache",
-        "secret_patterns":  _secret_patterns(),
-        "endpoint_patterns":_endpoint_patterns(),
-        "timeout":          args.timeout,
-        "workers":          args.workers,
-        "live_timeout":     args.live_timeout,
-        "live_wait":        args.live_wait,
-        "headless":         not args.no_headless,
-        "no_cache":         args.no_cache,
+        "domain":            domain,
+        "out_dir":           out,
+        "subs_file":         out / "subdomains.txt",
+        "alive_file":        out / "hosts_alive.txt",
+        "js_urls_file":      out / "js_urls.txt",
+        "secrets_txt":       out / "secrets.txt",
+        "secrets_csv":       out / "secrets.csv",
+        "secrets_jsonl":     out / "secrets.jsonl",
+        "endpoints_txt":     out / "endpoints.txt",
+        "endpoints_jsonl":   out / "endpoints.jsonl",
+        "summary_txt":       out / "SUMMARY.txt",
+        "summary_html":      out / "SUMMARY.html",
+        "log_file":          out / "jsrecon.log",
+        "cache_dir":         out / ".js_cache",
+        "secret_patterns":   _secret_patterns(),
+        "endpoint_patterns": _endpoint_patterns(),
+        "timeout":           args.timeout,
+        "workers":           args.workers,
+        "live_timeout":      args.live_timeout,
+        "live_wait":         args.live_wait,
+        "headless":          not args.no_headless,
+        "no_cache":          args.no_cache,
+        "no_mapscout":       args.no_mapscout,
     }
 
 
@@ -1191,25 +1233,32 @@ def write_summary_txt(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             return 0
         return sum(1 for l in p.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip())
 
+    maps_file = cfg["out_dir"] / "maps_exposed.jsonl"
+    maps_count = c(maps_file) if maps_file.exists() else 0
+
     lines = [
         "=" * 64,
         "  JSRECON — SUMÁRIO",
         f"  Alvo  : {cfg['domain']}",
         f"  Saída : {cfg['out_dir']}",
         "=" * 64, "",
-        f"  Subdomínios encontrados  : {str(stats.get('subs',0)).rjust(6)}",
-        f"  Hosts ativos (httpx)     : {str(stats.get('alive',0)).rjust(6)}",
-        f"  JS coletados (ao vivo)   : {str(stats.get('js',0)).rjust(6)}",
+        f"  Subdomínios encontrados  : {str(stats.get('subs', 0)).rjust(6)}",
+        f"  Hosts ativos (httpx)     : {str(stats.get('alive', 0)).rjust(6)}",
+        f"  JS coletados (target)    : {str(stats.get('js', 0)).rjust(6)}",
         "",
-        f"  Segredos encontrados     : {str(stats.get('secrets',0)).rjust(6)}",
+        f"  Segredos encontrados     : {str(stats.get('secrets', 0)).rjust(6)}",
     ] + _sev_summary(cfg["secrets_jsonl"]) + [
         "",
         f"  Endpoints extraídos      : {str(c(cfg['endpoints_jsonl'])).rjust(6)}",
+        f"  Source maps expostos     : {str(maps_count).rjust(6)}",
         "", "=" * 64,
         "", "  Arquivos gerados:",
     ] + [f"    {p.name}" for p in [
         cfg["secrets_txt"], cfg["secrets_csv"], cfg["secrets_jsonl"],
         cfg["endpoints_txt"], cfg["endpoints_jsonl"],
+        cfg["out_dir"] / "maps_exposed.txt",
+        cfg["out_dir"] / "maps_exposed.jsonl",
+        cfg["out_dir"] / "maps_exposed.html",
         cfg["alive_file"], cfg["js_urls_file"],
         cfg["summary_html"], cfg["log_file"],
     ] if p.exists()] + ["", "=" * 64]
@@ -1222,6 +1271,7 @@ def write_summary_txt(cfg: dict, logger: logging.Logger, stats: dict) -> None:
 def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
     findings:  list[dict] = []
     endpoints: list[dict] = []
+    maps:      list[dict] = []
 
     if cfg["secrets_jsonl"].exists():
         for line in cfg["secrets_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -1236,6 +1286,14 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
         for line in cfg["endpoints_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines():
             try:
                 endpoints.append(json.loads(line))
+            except Exception:
+                pass
+
+    maps_jsonl = cfg["out_dir"] / "maps_exposed.jsonl"
+    if maps_jsonl.exists():
+        for line in maps_jsonl.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                maps.append(json.loads(line))
             except Exception:
                 pass
 
@@ -1255,7 +1313,7 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
                   for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]}
 
     def _esc(s: str) -> str:
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     secret_rows = ""
     for f in findings:
@@ -1287,6 +1345,19 @@ def write_summary_html(cfg: dict, logger: logging.Logger, stats: dict) -> None:
             f'<td class="url-cell"><a href="{abs_}" target="_blank">{abs_[:80]}</a></td>'
             f'<td class="ctx">{qp}</td>'
             f'<td class="ctx">{src}</td></tr>\n'
+        )
+
+    map_rows = ""
+    for mp in maps:
+        map_rows += (
+            f'<tr>'
+            f'<td class="url-cell mono"><a href="{mp.get("js_url","")}" target="_blank">'
+            f'{_esc(mp.get("js_url","")[:100])}</a></td>'
+            f'<td class="url-cell"><a href="{mp.get("map_url","")}" target="_blank" style="color:#4ade80;font-weight:600">'
+            f'{_esc(mp.get("map_url","")[:100])}</a></td>'
+            f'<td class="center">{_esc(mp.get("size","?"))}</td>'
+            f'<td class="center">{_esc(mp.get("content_type","")[:40])}</td>'
+            f'</tr>\n'
         )
 
     types_opts  = "".join(f'<option value="{t}">{t}</option>'
@@ -1330,24 +1401,27 @@ tr:hover td{{background:#1a1d2e}}tr.hidden{{display:none}}
 .url-cell{{max-width:260px;word-break:break-all;font-size:12px}}
 .mono{{font-family:'SFMono-Regular',Consolas,monospace;font-size:11px;word-break:break-all;max-width:200px;color:#a3e635}}
 .ctx{{font-size:11px;color:#64748b;max-width:260px;word-break:break-all}}
+.center{{text-align:center;white-space:nowrap;color:#94a3b8;font-size:12px}}
 footer{{padding:.75rem 1.5rem;font-size:11px;color:#334155;border-top:1px solid #1e2130;text-align:center}}
 </style>
 </head>
 <body>
 <header>
   <h1>jsrecon — {cfg['domain']}</h1>
-  <p>{ts} · {stats.get('subs',0)} subs · {stats.get('alive',0)} hosts ativos · {stats.get('js',0)} JS · {len(findings)} segredos · {len(endpoints)} endpoints</p>
+  <p>{ts} · {stats.get('subs',0)} subs · {stats.get('alive',0)} hosts ativos · {stats.get('js',0)} JS (target) · {len(findings)} segredos · {len(endpoints)} endpoints · {len(maps)} source maps</p>
 </header>
 <div class="banner">
   {"".join(f'<div class="card"><div class="n" style="color:{sev_colors[s]}">{sev_counts[s]}</div><div class="l">{s}</div></div>' for s in ["CRITICAL","HIGH","MEDIUM","LOW"])}
   <div class="card"><div class="n" style="color:#60a5fa">{len(endpoints)}</div><div class="l">Endpoints</div></div>
-  <div class="card"><div class="n" style="color:#a78bfa">{stats.get('js',0)}</div><div class="l">JS</div></div>
+  <div class="card"><div class="n" style="color:#4ade80">{len(maps)}</div><div class="l">Source Maps</div></div>
+  <div class="card"><div class="n" style="color:#a78bfa">{stats.get('js',0)}</div><div class="l">JS (target)</div></div>
   <div class="card"><div class="n" style="color:#34d399">{stats.get('alive',0)}</div><div class="l">Hosts ativos</div></div>
   <div class="card"><div class="n" style="color:#fb923c">{stats.get('subs',0)}</div><div class="l">Subdomínios</div></div>
 </div>
 <div class="tabs">
   <div class="tab active" onclick="switchTab('s',this)">🔑 Segredos ({len(findings)})</div>
   <div class="tab" onclick="switchTab('e',this)">🔗 Endpoints ({len(endpoints)})</div>
+  <div class="tab" onclick="switchTab('m',this)">🗺️ Source Maps ({len(maps)})</div>
 </div>
 
 <div id="tab-s" class="tab-content active">
@@ -1377,7 +1451,18 @@ footer{{padding:.75rem 1.5rem;font-size:11px;color:#334155;border-top:1px solid 
 </tr></thead><tbody>{ep_rows}</tbody></table>
 </div>
 
-<footer>jsrecon · {cfg['domain']} · {len(findings)} segredos · {len(endpoints)} endpoints · {ts}</footer>
+<div id="tab-m" class="tab-content">
+<div class="ctrl">
+  <input id="ms" type="search" placeholder="Buscar…" oninput="fm()">
+  <span id="mc2" class="cnt">{len(maps)} de {len(maps)}</span>
+</div>
+<table id="mt"><thead><tr>
+  <th onclick="sort('mt',0)">JS URL ↕</th><th onclick="sort('mt',1)">MAP URL ↕</th>
+  <th>Size</th><th>Content-Type</th>
+</tr></thead><tbody>{map_rows}</tbody></table>
+</div>
+
+<footer>jsrecon · {cfg['domain']} · {len(findings)} segredos · {len(endpoints)} endpoints · {len(maps)} source maps · {ts}</footer>
 <script>
 function switchTab(n,el){{
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -1400,6 +1485,13 @@ function fe(){{
     const ok=(!mv||b===mv)&&(!q||r.textContent.toLowerCase().includes(q));r.classList.toggle('hidden',!ok);if(ok)v++;}});
   document.getElementById('ec').textContent=v+' de {len(endpoints)}';
 }}
+const mr=Array.from(document.querySelectorAll('#mt tbody tr'));
+function fm(){{
+  const q=document.getElementById('ms').value.toLowerCase();
+  let v=0;
+  mr.forEach(r=>{{const ok=!q||r.textContent.toLowerCase().includes(q);r.classList.toggle('hidden',!ok);if(ok)v++;}});
+  document.getElementById('mc2').textContent=v+' de {len(maps)}';
+}}
 let sd={{}};
 function sort(tid,col){{
   const tbody=document.querySelector('#'+tid+' tbody');
@@ -1407,7 +1499,7 @@ function sort(tid,col){{
   const k=tid+col;sd[k]=(sd[k]||1)*-1;
   rs.sort((a,b)=>sd[k]*(a.cells[col]?.textContent.trim()||'').localeCompare(b.cells[col]?.textContent.trim()||''));
   rs.forEach(r=>tbody.appendChild(r));
-  tid==='st'?fs():fe();
+  if(tid==='st')fs();else if(tid==='et')fe();else fm();
 }}
 </script>
 </body>
@@ -1424,26 +1516,31 @@ function sort(tid,col){{
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="jsrecon",
-        description="Recon autônomo de JS: subs → nmap → httpx → browser → análise de segredos + endpoints.",
+        description=(
+            "Recon autônomo de JS: subs → nmap → httpx → browser → "
+            "filtro de JS do target → análise → mapscout."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  python3 jsrecon.py exemplo.com.br
-  python3 jsrecon.py exemplo.com.br --no-nmap --workers 30
-  python3 jsrecon.py exemplo.com.br --no-subs --live-timeout 45
-  python3 jsrecon.py exemplo.com.br --no-headless       # browser visível (debug)
+  python3 jsrecon.py ifood.com.br
+  python3 jsrecon.py ifood.com.br --no-nmap --workers 30
+  python3 jsrecon.py ifood.com.br --no-subs --live-timeout 45
+  python3 jsrecon.py ifood.com.br --no-headless       # browser visível (debug)
+  python3 jsrecon.py ifood.com.br --no-mapscout       # pula detecção de source maps
         """,
     )
-    p.add_argument("domain",            help="Domínio alvo (ex: exemplo.com.br)")
-    p.add_argument("--no-subs",         action="store_true", help="Pula enumeração de subdomínios")
-    p.add_argument("--no-nmap",         action="store_true", help="Pula scan de portas com nmap")
-    p.add_argument("--no-live",         action="store_true", help="Pula coleta de JS via browser")
-    p.add_argument("--no-headless",     action="store_true", help="Abre o browser visível (debug)")
-    p.add_argument("--no-cache",        action="store_true", help="Ignora cache de JS em disco")
-    p.add_argument("--workers",         type=int, default=20, help="Workers de análise JS (padrão: 20)")
-    p.add_argument("--timeout",         type=int, default=10, help="Timeout HTTP em segundos (padrão: 10)")
-    p.add_argument("--live-timeout",    type=int, default=30, help="Timeout de navegação do browser em segundos (padrão: 30)")
-    p.add_argument("--live-wait",       type=int, default=2,  help="Segundos extras após networkidle (padrão: 2)")
+    p.add_argument("domain",         help="Domínio alvo (ex: ifood.com.br)")
+    p.add_argument("--no-subs",      action="store_true", help="Pula enumeração de subdomínios")
+    p.add_argument("--no-nmap",      action="store_true", help="Pula scan de portas com nmap")
+    p.add_argument("--no-live",      action="store_true", help="Pula coleta de JS via browser")
+    p.add_argument("--no-headless",  action="store_true", help="Abre o browser visível (debug)")
+    p.add_argument("--no-cache",     action="store_true", help="Ignora cache de JS em disco")
+    p.add_argument("--no-mapscout",  action="store_true", help="Pula detecção de source maps expostos")
+    p.add_argument("--workers",      type=int, default=20, help="Workers de análise JS (padrão: 20)")
+    p.add_argument("--timeout",      type=int, default=10, help="Timeout HTTP em segundos (padrão: 10)")
+    p.add_argument("--live-timeout", type=int, default=30, help="Timeout do browser em segundos (padrão: 30)")
+    p.add_argument("--live-wait",    type=int, default=2,  help="Segundos extras após networkidle (padrão: 2)")
     return p.parse_args()
 
 
@@ -1459,12 +1556,14 @@ def main() -> None:
             domain = domain[len(_pfx):]
             break
     domain = domain.rstrip("/")
+
     cfg    = make_cfg(domain, args)
     logger = setup_logging(cfg["log_file"])
     stats: dict[str, int] = {}
 
     logger.info("=" * 60)
     logger.info("jsrecon  —  alvo: %s", domain)
+    logger.info("Filtro  : %s  e  *.%s  (apenas JS do target)", domain, domain)
     logger.info("Saída   : %s", cfg["out_dir"])
     logger.info("=" * 60)
 
@@ -1486,23 +1585,23 @@ def main() -> None:
         open_ports = nmap_scan(subs, cfg, logger)
 
     # ── 3. httpx ──────────────────────────────────────────────────────────────
-    alive_urls = httpx_probe(open_ports, cfg, logger)
+    alive_urls, confirmed_hosts = httpx_probe(open_ports, cfg, logger)
     stats["alive"] = len(alive_urls)
 
     if not alive_urls:
         logger.warning("Nenhum host ativo encontrado — encerrando.")
         sys.exit(0)
 
-    # ── 4. Coleta de JS ao vivo ───────────────────────────────────────────────
+    # ── 4. Coleta de JS ao vivo + FILTRO DE DOMÍNIO ───────────────────────────
     if args.no_live:
         logger.info("--no-live: pulando coleta via browser.")
         js_urls: set[str] = set()
     else:
-        js_urls = collect_live_js(alive_urls, cfg, logger)
+        js_urls = collect_live_js(alive_urls, confirmed_hosts, cfg, logger)
     stats["js"] = len(js_urls)
 
-    # ── 5. Análise de JS ──────────────────────────────────────────────────────
-    logger.info("═══ Análise de JS ═══")
+    # ── 5. Análise de JS (somente target) ─────────────────────────────────────
+    logger.info("═══ Análise de JS (%d arquivos do target) ═══", len(js_urls))
     total_secrets = analyze_js_list(sorted(js_urls), cfg, logger)
     stats["secrets"] = total_secrets
 
@@ -1511,11 +1610,23 @@ def main() -> None:
     else:
         logger.info("Nenhum segredo encontrado.")
 
-    ep_count = sum(1 for l in cfg["endpoints_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines()
-                   if l.strip()) if cfg["endpoints_jsonl"].exists() else 0
+    ep_count = 0
+    if cfg["endpoints_jsonl"].exists():
+        ep_count = sum(
+            1 for l in cfg["endpoints_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines()
+            if l.strip()
+        )
     logger.info("Endpoints extraídos: %d → %s", ep_count, cfg["endpoints_txt"])
 
-    # ── 6. Relatórios ─────────────────────────────────────────────────────────
+    # ── 6. mapscout ───────────────────────────────────────────────────────────
+    maps_count = 0
+    if not args.no_mapscout:
+        maps_count = run_mapscout(js_urls, confirmed_hosts, cfg, logger)
+        stats["maps"] = maps_count
+    else:
+        logger.info("--no-mapscout: pulando detecção de source maps.")
+
+    # ── 7. Relatórios ─────────────────────────────────────────────────────────
     write_summary_txt(cfg, logger, stats)
     write_summary_html(cfg, logger, stats)
 
