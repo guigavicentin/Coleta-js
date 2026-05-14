@@ -103,8 +103,8 @@ def _build_target_filter(root_domain: str, confirmed_hosts: set[str]) -> callabl
     Retorna uma função que aceita uma URL e indica se ela pertence ao target.
 
     Regras (qualquer uma basta):
-      1. host == root_domain                  → ifood.com.br
-      2. host termina com .root_domain        → api.ifood.com.br
+      1. host == root_domain                  → target.com.br
+      2. host termina com .root_domain        → api.target.com.br
       3. host está em confirmed_hosts         → hosts confirmados pelo httpx
     """
     root = root_domain.lower().lstrip("*.")
@@ -1523,14 +1523,14 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  python3 jsrecon.py ifood.com.br
-  python3 jsrecon.py ifood.com.br --no-nmap --workers 30
-  python3 jsrecon.py ifood.com.br --no-subs --live-timeout 45
-  python3 jsrecon.py ifood.com.br --no-headless       # browser visível (debug)
-  python3 jsrecon.py ifood.com.br --no-mapscout       # pula detecção de source maps
+  python3 jsrecon.py target.com.br
+  python3 jsrecon.py target.com.br --no-nmap --workers 30
+  python3 jsrecon.py target.com.br --no-subs --live-timeout 45
+  python3 jsrecon.py target.com.br --no-headless       # browser visível (debug)
+  python3 jsrecon.py target.com.br --no-mapscout       # pula detecção de source maps
         """,
     )
-    p.add_argument("domain",         help="Domínio alvo (ex: ifood.com.br)")
+    p.add_argument("domain",         help="Domínio alvo (ex: target.com.br)")
     p.add_argument("--no-subs",      action="store_true", help="Pula enumeração de subdomínios")
     p.add_argument("--no-nmap",      action="store_true", help="Pula scan de portas com nmap")
     p.add_argument("--no-live",      action="store_true", help="Pula coleta de JS via browser")
