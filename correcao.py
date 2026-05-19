@@ -1003,7 +1003,6 @@ async def live_crawl_all(targets: list[str], cfg: dict,
                 # Filtro de CDN apenas (filtro de domínio é feito depois)
                 if not _CDN_RE.search(js_url):
                     all_js.add(js_url)
-            logger.info("  → %d JS capturados (bruto, pré-filtro)", len(files))
         except Exception as e:
             logger.error("  [browser] erro em %s: %s", url, e)
 
