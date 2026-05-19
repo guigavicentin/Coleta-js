@@ -491,21 +491,34 @@ async def collect_js(url: str, timeout_s: int, wait_s: int,
     seen: set[str] = set()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless)
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+            viewport={"width": 1920, "height": 1080},
             ignore_https_errors=True,
         )
         page = await ctx.new_page()
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
 
         def on_request(req):
             ru = req.url
-            path = urlparse(ru).path.lower()
-            if ru not in seen and (path.endswith(".js") or path.endswith(".mjs") or ".js?" in path):
+            rpath = urlparse(ru).path.lower()
+            if ru not in seen and (rpath.endswith(".js") or rpath.endswith(".mjs") or ".js?" in rpath):
                 seen.add(ru)
                 js_urls.append(ru)
                 logger.debug("  [JS] %s", ru)
@@ -514,9 +527,7 @@ async def collect_js(url: str, timeout_s: int, wait_s: int,
 
         logger.info("  🌐 Abrindo %s", url)
         try:
-            #await page.goto(url, timeout=timeout_s * 1000, wait_until="networkidle")
             await page.goto(url, timeout=timeout_s * 1000, wait_until="load")
-
         except Exception as e:
             logger.warning("  [nav] %s — continuando", e)
 
