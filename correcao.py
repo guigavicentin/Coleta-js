@@ -261,6 +261,153 @@ def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
     ]
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Análise de ofuscação
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. Char-code arrays  [72,101,108,108,111] → "Hello"
+_CHARCODE_RE = re.compile(r'\[\s*(\d{2,3}(?:\s*,\s*\d{2,3}){5,})\s*\]')
+_DECODED_CHECKS = [
+    ("bcrypt_hash_decoded",  re.compile(r'\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}')),
+    ("google_key_decoded",   re.compile(r'AIza[0-9A-Za-z\-_]{35}')),
+    ("aws_key_decoded",      re.compile(r'AKIA[0-9A-Z]{16}')),
+    ("jwt_decoded",          re.compile(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
+    ("high_entropy_decoded", None),
+]
+
+def _decode_charcode(s: str) -> str | None:
+    try:
+        codes = [int(x.strip()) for x in s.split(",")]
+        if any(c < 32 or c > 126 for c in codes):
+            return None
+        return "".join(chr(c) for c in codes)
+    except ValueError:
+        return None
+
+def scan_charcode_arrays(content: str, url: str, cfg: dict, logger: logging.Logger) -> int:
+    found = 0
+    for m in _CHARCODE_RE.finditer(content):
+        decoded = _decode_charcode(m.group(1))
+        if not decoded or len(decoded) < 8:
+            continue
+        label = None
+        for lbl, pat in _DECODED_CHECKS:
+            if pat is None:
+                if _entropy(decoded) >= 3.5:
+                    label = lbl
+                break
+            if pat.search(decoded):
+                label = lbl
+                break
+        if label:
+            ctx = content[max(0, m.start()-60):min(len(content), m.end()+60)].replace("\n", " ")
+            finding = {"type": label, "value": decoded, "url": url, "context": ctx}
+            if _save_secret(finding, cfg):
+                logger.warning("[!!!] %s (char-array) decoded: %s | %s", label, decoded[:80], url)
+                found += 1
+    return found
+
+
+# 2. String lookup tables  _0x1234=['a','b',...] + _0x1234(0x5) → 'b'
+_LOOKUP_DEF_RE  = re.compile(r'var\s+(_0x[0-9a-f]+)\s*=\s*\[([^\]]{20,})\]', re.I)
+_LOOKUP_CALL_RE = re.compile(r'(_0x[0-9a-f]+)\s*\(\s*(0x[0-9a-f]+|\d+)\s*\)', re.I)
+
+def _build_lookup_tables(content: str) -> dict[str, list[str]]:
+    tables: dict[str, list[str]] = {}
+    for m in _LOOKUP_DEF_RE.finditer(content):
+        strings = re.findall(r'["\']([^"\']*)["\']', m.group(2))
+        if strings:
+            tables[m.group(1)] = strings
+    return tables
+
+def _resolve_lookup(content: str, tables: dict[str, list[str]]) -> str:
+    def replacer(m: re.Match) -> str:
+        var, idx_raw = m.group(1), m.group(2)
+        idx = int(idx_raw, 16) if idx_raw.startswith("0x") else int(idx_raw)
+        if var in tables and 0 <= idx < len(tables[var]):
+            return '"' + tables[var][idx] + '"'
+        return m.group(0)
+    try:
+        return _LOOKUP_CALL_RE.sub(replacer, content)
+    except Exception:
+        return content
+
+def scan_lookup_tables(content: str, url: str, cfg: dict, logger: logging.Logger) -> int:
+    tables = _build_lookup_tables(content)
+    if not tables:
+        return 0
+    resolved = _resolve_lookup(content, tables)
+    if resolved == content:
+        return 0
+    found = 0
+    for name, pattern in cfg["secret_patterns"].items():
+        for m in pattern.finditer(resolved):
+            raw   = m.group(0)
+            value = m.group(1) if m.lastindex and m.lastindex >= 1 else raw
+            if name in _GENERIC_PATTERNS and not _is_real_cred(value):
+                continue
+            if name == "jwt" and not _is_real_jwt(value):
+                continue
+            ctx = resolved[max(0, m.start()-90):min(len(resolved), m.end()+90)].replace("\n", " ")
+            finding = {"type": name, "value": value, "url": url,
+                       "context": f"[DEOBF] {ctx[:250]}"}
+            if _save_secret(finding, cfg):
+                logger.warning("[!!!] %s (deobf) → %s | %s", name, value[:80], url)
+                found += 1
+    return found
+
+
+# 3. High-entropy strings — strings suspeitas mesmo sem padrão conhecido
+_HIGH_ENTROPY_CTX_RE = re.compile(
+    r'(?:key|token|secret|pass|pwd|auth|api|credential|bearer|access)'
+    r'\s*[:=]\s*["\']([A-Za-z0-9+/=_\-\.]{20,})["\']',
+    re.I,
+)
+_HEX_STRING_RE = re.compile(r'["\']([0-9a-f]{32,})["\']', re.I)
+_B64_STRING_RE = re.compile(r'["\']([A-Za-z0-9+/]{40,}={0,2})["\']')
+
+def scan_high_entropy(content: str, url: str, cfg: dict, logger: logging.Logger) -> int:
+    found = 0
+    seen: set[str] = set()
+
+    for m in _HIGH_ENTROPY_CTX_RE.finditer(content):
+        val = m.group(1)
+        if val in seen or _entropy(val) < 3.8:
+            continue
+        seen.add(val)
+        ctx = content[max(0, m.start()-60):min(len(content), m.end()+60)].replace("\n", " ")
+        if _save_secret({"type": "high_entropy_string", "value": val, "url": url, "context": ctx}, cfg):
+            logger.warning("[!!!] high_entropy_string → %s | %s", val[:80], url)
+            found += 1
+
+    for m in _HEX_STRING_RE.finditer(content):
+        val = m.group(1)
+        if val in seen or len(val) < 32 or _entropy(val) < 3.5:
+            continue
+        seen.add(val)
+        ctx = content[max(0, m.start()-60):min(len(content), m.end()+60)].replace("\n", " ")
+        if _save_secret({"type": "high_entropy_hex", "value": val, "url": url, "context": ctx}, cfg):
+            logger.warning("[!!!] high_entropy_hex (len=%d) → %s | %s", len(val), val[:80], url)
+            found += 1
+
+    for m in _B64_STRING_RE.finditer(content):
+        val = m.group(1)
+        if val in seen or len(val) < 40 or _entropy(val) < 4.0:
+            continue
+        try:
+            decoded = _b64.b64decode(val + "==").decode("utf-8", errors="replace")
+            if not re.search(r'(?:pass|key|secret|token|auth)', decoded, re.I) and _entropy(val) < 4.5:
+                continue
+        except Exception:
+            continue
+        seen.add(val)
+        ctx = content[max(0, m.start()-60):min(len(content), m.end()+60)].replace("\n", " ")
+        if _save_secret({"type": "high_entropy_b64", "value": val, "url": url, "context": ctx}, cfg):
+            logger.warning("[!!!] high_entropy_b64 decoded: %s | %s", decoded[:80], url)
+            found += 1
+
+    return found
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Estado global thread-safe
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -372,6 +519,15 @@ def analyze_js(content: str, url: str, cfg: dict, logger: logging.Logger) -> int
         if _save_secret({"type": "btoa_decoded", "value": raw_val, "url": url, "context": ctx}, cfg):
             logger.warning("[!!!] btoa → '%s' | %s", raw_val, url)
             found += 1
+
+    # Ofuscação: char-code arrays
+    found += scan_charcode_arrays(content, url, cfg, logger)
+
+    # Ofuscação: string lookup tables (_0x1234)
+    found += scan_lookup_tables(content, url, cfg, logger)
+
+    # High-entropy strings
+    found += scan_high_entropy(content, url, cfg, logger)
 
     for label, pattern, method_hint in cfg["endpoint_patterns"]:
         for m in pattern.finditer(content):
