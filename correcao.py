@@ -1,60 +1,152 @@
+#!/usr/bin/env python3
 """
-SUBSTITUIÇÃO para a função _playwright_crawl em jsrecon.py
-─────────────────────────────────────────────────────────────────────────────
-Problema original:
-  • page.on("request") intercepta ANTES de os chunks serem solicitados
-  • .js no path falha para URLs do tipo /956.8df871f4bf4dee81ca1a.js
-    (sem subpasta, hash no nome — o check original usava .js in path, OK)
-  • wait_until="networkidle" para cedo: webpack carrega chunks em lazy load
-    APÓS a rede "silenciar" pela primeira vez
+correcao.py — Coleta standalone de arquivos JavaScript via browser real.
 
-Correções aplicadas:
-  1. Usar page.on("response") em vez de page.on("request")
-     → captura DEPOIS que o browser realmente recebeu o arquivo
-     → dá para checar Content-Type: application/javascript
-  2. Scroll automático até o fundo da página
-     → dispara lazy-load de rotas / componentes
-  3. wait_until="load" (mais tolerante que networkidle)
-     + asyncio.sleep generoso depois
-  4. Extrair URLs do manifesto webpack/asset-manifest automaticamente
-  5. Checar tanto o path (".js" no caminho) quanto o Content-Type da resposta
+Uso:
+  python3 correcao.py <domínio ou URL>
+  python3 correcao.py zoop.com.br
+  python3 correcao.py https://cartexpress.minhaconta.zoop.com.br
+  python3 correcao.py zoop.com.br --timeout 60 --wait 8 --show-browser
+  python3 correcao.py zoop.com.br --urls-only          # só imprime as URLs
 
-Uso: copie esta função para dentro de jsrecon.py substituindo a original.
-─────────────────────────────────────────────────────────────────────────────
+Dependências:
+  pip install playwright requests
+  playwright install chromium
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
+import json
 import logging
-from urllib.parse import urlparse
+import re
+import sys
+import urllib3
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Função principal (substitui a original em jsrecon.py)
-# ──────────────────────────────────────────────────────────────────────────────
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-async def _playwright_crawl(
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    print("[ERRO] Playwright não instalado.")
+    print("       pip install playwright && playwright install chromium")
+    sys.exit(1)
+
+import requests
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CDN conhecidos — sempre descartados
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CDN_RE = re.compile(
+    r'(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|'
+    r'ajax\.googleapis\.com|stackpath\.bootstrapcdn\.com|'
+    r'maxcdn\.bootstrapcdn\.com|code\.jquery\.com|'
+    r'cdn\.datatables\.net|cdn\.polyfill\.io|'
+    r'static\.cloudflareinsights\.com)',
+    re.I,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtro de domínio alvo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _belongs_to_target(js_url: str, root: str, extra_hosts: set[str]) -> bool:
+    try:
+        host = urlparse(js_url).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    root = root.lower().lstrip("*.")
+    return host == root or host.endswith(f".{root}") or host in extra_hosts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detecta se é JS pelo path ou pelo Content-Type
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_js(url: str, content_type: str) -> bool:
+    path = urlparse(url).path.lower()
+    ct   = (content_type or "").lower()
+    return (
+        path.endswith(".js")
+        or path.endswith(".mjs")
+        or ".js?" in path
+        or "javascript" in ct
+        or "ecmascript" in ct
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extrai URLs extras do manifesto webpack / HTML
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _extract_manifest_urls(page, base_url: str, logger: logging.Logger) -> list[str]:
+    found: list[str] = []
+
+    # 1. asset-manifest.json (React CRA, Vite)
+    for mpath in ["/asset-manifest.json", "/static/asset-manifest.json", "/webpack-stats.json"]:
+        try:
+            murl = urljoin(base_url, mpath)
+            r = requests.get(murl, timeout=8, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0 jsrecon"})
+            if r.status_code == 200:
+                data = r.json()
+                files = data.get("files", data)
+                if isinstance(files, dict):
+                    for v in files.values():
+                        if isinstance(v, str) and v.endswith(".js"):
+                            found.append(urljoin(base_url, v))
+                if found:
+                    logger.info("  [manifest] %d URLs via %s", len(found), mpath)
+                    break
+        except Exception:
+            pass
+
+    # 2. Tags <script src> no HTML já renderizado
+    try:
+        html = await page.content()
+
+        for m in re.finditer(
+            r'(?:src|href)=["\']([^"\']*?\.(?:js|mjs)(?:\?[^"\']*)?)["\']',
+            html, re.I,
+        ):
+            raw = m.group(1)
+            if raw.startswith("/"):
+                raw = urljoin(base_url, raw)
+            if raw.startswith("http"):
+                found.append(raw)
+
+        # Padrão de chunk webpack: "956.8df871f4bf4dee8"
+        for m in re.finditer(r'"([0-9a-f]{3,4}\.[0-9a-f]{14,})"', html):
+            name = m.group(1)
+            found.append(urljoin(base_url, f"/static/js/{name}.chunk.js"))
+            found.append(urljoin(base_url, f"/{name}.js"))
+
+    except Exception as e:
+        logger.debug("  [manifest] html parse error: %s", e)
+
+    return list(set(found))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crawl principal
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def crawl(
     url: str,
     timeout_s: int,
     wait_s: int,
     headless: bool,
     logger: logging.Logger,
-) -> list[dict]:
-    """
-    Versão corrigida: usa response interception + scroll + manifest parse.
-    Captura chunks JS com hash no nome (ex: 956.8df871f4bf4dee8.js).
-    """
-    from playwright.async_api import async_playwright
-    import re, json
-
-    js_files: list[dict] = []
-    seen: set[str] = set()
-
-    def _is_js_url(resp_url: str, content_type: str) -> bool:
-        """Aceita a URL se o path termina em .js OU se o Content-Type é JS."""
-        path = urlparse(resp_url).path.lower()
-        ct   = (content_type or "").lower()
-        path_ok = path.endswith(".js") or ".js?" in path
-        ct_ok   = "javascript" in ct or "ecmascript" in ct
-        return path_ok or ct_ok
+) -> list[str]:
+    """Abre a URL no browser, captura todos os JS e retorna lista de URLs."""
+    seen: set[str]       = set()
+    js_urls: list[str]   = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
@@ -68,155 +160,167 @@ async def _playwright_crawl(
         )
         page = await ctx.new_page()
 
-        # ── Intercepta RESPOSTAS (não requests) ──────────────────────────────
+        # ── Intercepta RESPOSTAS (captura content-type real) ─────────────────
         async def on_response(resp):
             try:
-                resp_url = resp.url
-                ct       = resp.headers.get("content-type", "")
-                if resp_url in seen:
-                    return
-                if _is_js_url(resp_url, ct):
-                    seen.add(resp_url)
-                    parsed = urlparse(resp_url)
-                    js_files.append({
-                        "url":      resp_url,
-                        "domain":   parsed.netloc,
-                        "path":     parsed.path,
-                        "resource": "script",
-                    })
+                rurl = resp.url
+                ct   = resp.headers.get("content-type", "")
+                if rurl not in seen and _is_js(rurl, ct):
+                    seen.add(rurl)
+                    js_urls.append(rurl)
+                    logger.debug("  [JS] %s", rurl)
             except Exception:
                 pass
 
         page.on("response", on_response)
 
-        # ── Navega com wait_until="load" (mais tolerante) ────────────────────
-        logger.info("  🌐 Browser → %s", url)
+        # ── Navega (wait_until="load" é mais tolerante que networkidle) ───────
+        logger.info("  🌐  Abrindo %s", url)
         try:
-            await page.goto(
-                url,
-                timeout=timeout_s * 1000,
-                wait_until="load",           # <── era "networkidle"
-            )
+            await page.goto(url, timeout=timeout_s * 1000, wait_until="load")
         except Exception as e:
-            logger.debug("  [browser] load timeout em %s: %s", url, e)
+            logger.warning("  [nav] %s — continuando mesmo assim", e)
 
-        # ── Pausa inicial para scripts assíncronos ────────────────────────────
+        # ── Pausa inicial ─────────────────────────────────────────────────────
         await asyncio.sleep(max(wait_s, 3))
 
-        # ── Scroll para disparar lazy loading ────────────────────────────────
+        # ── Scroll para disparar lazy-load / code splitting ───────────────────
         try:
             await page.evaluate("""
                 async () => {
                     const delay = ms => new Promise(r => setTimeout(r, ms));
-                    for (let i = 0; i < 5; i++) {
+                    for (let i = 0; i < 6; i++) {
                         window.scrollBy(0, window.innerHeight);
-                        await delay(600);
+                        await delay(700);
                     }
                     window.scrollTo(0, 0);
-                    await delay(500);
+                    await delay(600);
                 }
             """)
+            logger.info("  [scroll] feito")
         except Exception as e:
-            logger.debug("  [browser] scroll error: %s", e)
+            logger.debug("  [scroll] %s", e)
 
-        # ── Segunda pausa pós-scroll ──────────────────────────────────────────
-        await asyncio.sleep(2)
+        # ── Pausa pós-scroll ──────────────────────────────────────────────────
+        await asyncio.sleep(3)
 
-        # ── Tenta extrair URLs do manifesto webpack / asset-manifest ─────────
-        manifest_urls = await _extract_manifest_urls(page, url, logger)
-        for mu in manifest_urls:
-            if mu not in seen:
-                seen.add(mu)
-                parsed = urlparse(mu)
-                js_files.append({
-                    "url":      mu,
-                    "domain":   parsed.netloc,
-                    "path":     parsed.path,
-                    "resource": "script_manifest",
-                })
+        # ── Manifesto / HTML para chunks não disparados ───────────────────────
+        extras = await _extract_manifest_urls(page, url, logger)
+        for u in extras:
+            if u not in seen:
+                seen.add(u)
+                js_urls.append(u)
 
         await browser.close()
 
-    logger.info("  → %d JS capturados (bruto, pré-filtro)", len(js_files))
-    return js_files
+    return js_urls
 
 
-async def _extract_manifest_urls(page, base_url: str, logger: logging.Logger) -> list[str]:
-    """
-    Tenta ler asset-manifest.json / webpack-manifest / __webpack_modules__
-    para descobrir URLs de chunks que o scroll pode não ter disparado.
-    """
-    import re, json
-    import requests
-    from urllib.parse import urljoin
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
-    found: list[str] = []
-
-    # 1. Manifesto estático comum em React/CRA e Next.js
-    for manifest_path in [
-        "/asset-manifest.json",
-        "/static/asset-manifest.json",
-        "/_next/static/chunks/",
-        "/webpack-stats.json",
-    ]:
-        try:
-            manifest_url = urljoin(base_url, manifest_path)
-            r = requests.get(manifest_url, timeout=8, verify=False,
-                             headers={"User-Agent": "Mozilla/5.0 jsrecon"})
-            if r.status_code == 200 and "javascript" in r.headers.get("content-type", "").lower() or \
-               r.status_code == 200 and manifest_path.endswith(".json"):
-                data = r.json()
-                # CRA format: {"files": {"main.js": "/static/js/main.xxx.js"}}
-                files = data.get("files", data)
-                for k, v in (files.items() if isinstance(files, dict) else {}.items()):
-                    if isinstance(v, str) and v.endswith(".js"):
-                        found.append(urljoin(base_url, v))
-                if found:
-                    logger.info("  [manifest] %d URLs via %s", len(found), manifest_path)
-                    break
-        except Exception:
-            pass
-
-    # 2. Extrai URLs de chunks do HTML já carregado
-    try:
-        html = await page.content()
-        # Padrão: src="/static/js/936.abc123.chunk.js" ou src="/123.abc.js"
-        for m in re.finditer(
-            r'(?:src|href)=["\']([^"\']*?\.(?:js|mjs)(?:\?[^"\']*)?)["\']',
-            html,
-            re.I,
-        ):
-            chunk_url = m.group(1)
-            if chunk_url.startswith("/"):
-                from urllib.parse import urljoin
-                chunk_url = urljoin(base_url, chunk_url)
-            if chunk_url.startswith("http"):
-                found.append(chunk_url)
-
-        # Padrão webpack: "chunk": "956.8df871f4bf4dee8"
-        for m in re.finditer(r'"([0-9a-f]{3,4}\.[0-9a-f]{16,})"', html):
-            name = m.group(1)
-            found.append(urljoin(base_url, f"/static/js/{name}.chunk.js"))
-            found.append(urljoin(base_url, f"/{name}.js"))
-
-    except Exception as e:
-        logger.debug("  [manifest] html parse error: %s", e)
-
-    return list(set(found))
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="correcao",
+        description="Coleta arquivos JS de uma URL via browser real (Playwright).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemplos:
+  python3 correcao.py zoop.com.br
+  python3 correcao.py https://cartexpress.minhaconta.zoop.com.br
+  python3 correcao.py zoop.com.br --timeout 60 --wait 8
+  python3 correcao.py zoop.com.br --all-domains       # não filtra por domínio
+  python3 correcao.py zoop.com.br --urls-only         # só URLs, sem log
+  python3 correcao.py zoop.com.br --show-browser      # abre janela do Chrome
+  python3 correcao.py zoop.com.br --out js_urls.txt   # salva em arquivo
+        """,
+    )
+    p.add_argument("target",        help="Domínio ou URL alvo (ex: zoop.com.br)")
+    p.add_argument("--timeout",     type=int, default=40,  help="Timeout do browser em segundos (padrão: 40)")
+    p.add_argument("--wait",        type=int, default=5,   help="Segundos extras após load (padrão: 5)")
+    p.add_argument("--show-browser",action="store_true",   help="Abre janela visível do Chrome (não headless)")
+    p.add_argument("--all-domains", action="store_true",   help="Inclui JS de domínios terceiros (sem filtro)")
+    p.add_argument("--urls-only",   action="store_true",   help="Imprime só as URLs, sem logs")
+    p.add_argument("--out",         default="",            help="Salva URLs em arquivo (ex: --out js.txt)")
+    return p.parse_args()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# INSTRUÇÕES DE INTEGRAÇÃO
-# ──────────────────────────────────────────────────────────────────────────────
-#
-# 1. No jsrecon.py, substitua toda a função _playwright_crawl pela versão
-#    acima (incluindo _extract_manifest_urls como função auxiliar).
-#
-# 2. Opcionalmente, aumente o live_wait padrão no parse_args:
-#       --live-wait default=5  (era 2)
-#
-# 3. Para o site da imagem (cartexpress), rode:
-#       python3 jsrecon.py cartexpress.minhaconta.zoop.com.br \
-#           --no-subs --no-nmap --live-timeout 45 --live-wait 5
-#
-# ──────────────────────────────────────────────────────────────────────────────
+def setup_logger(quiet: bool) -> logging.Logger:
+    logger = logging.getLogger("correcao")
+    logger.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler(sys.stderr if quiet else sys.stdout)
+    ch.setLevel(logging.WARNING if quiet else logging.INFO)
+    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+    logger.addHandler(ch)
+    return logger
+
+
+def normalise_url(target: str) -> tuple[str, str]:
+    """Retorna (url_completa, domínio_raiz)."""
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+    root = urlparse(target).netloc.lower().lstrip("www.")
+    return target, root
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args   = parse_args()
+    logger = setup_logger(quiet=args.urls_only)
+
+    url, root = normalise_url(args.target)
+
+    if not args.urls_only:
+        logger.info("=" * 56)
+        logger.info("Alvo   : %s", url)
+        logger.info("Root   : %s", root)
+        logger.info("Timeout: %ds  |  Wait: %ds", args.timeout, args.wait)
+        logger.info("=" * 56)
+
+    # Coleta bruta
+    all_js = asyncio.run(crawl(
+        url       = url,
+        timeout_s = args.timeout,
+        wait_s    = args.wait,
+        headless  = not args.show_browser,
+        logger    = logger,
+    ))
+
+    # Filtro de domínio (salvo se --all-domains)
+    if args.all_domains:
+        filtered = [u for u in all_js if not _CDN_RE.search(u)]
+    else:
+        filtered = [
+            u for u in all_js
+            if not _CDN_RE.search(u) and _belongs_to_target(u, root, set())
+        ]
+
+    filtered.sort()
+
+    if not args.urls_only:
+        logger.info("")
+        logger.info("─── Resultado ───────────────────────────────────────")
+        logger.info("JS bruto capturado   : %d", len(all_js))
+        logger.info("Após filtro de domínio: %d", len(filtered))
+        logger.info("─────────────────────────────────────────────────────")
+
+    # Saída
+    for u in filtered:
+        print(u)
+
+    if args.out:
+        out = Path(args.out)
+        out.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+        if not args.urls_only:
+            logger.info("Salvo em: %s", out)
+
+    if not args.urls_only:
+        logger.info("Concluído.")
+
+
+if __name__ == "__main__":
+    main()
