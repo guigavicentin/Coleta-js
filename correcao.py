@@ -850,25 +850,25 @@ async def _playwright_crawl(
         page = await ctx.new_page()
 
         # ── Intercepta RESPOSTAS (não requests) ──────────────────────────────
-        async def on_response(resp):
-            try:
-                resp_url = resp.url
-                ct       = resp.headers.get("content-type", "")
-                if resp_url in seen:
-                    return
-                if _is_js_url(resp_url, ct):
-                    seen.add(resp_url)
-                    parsed = urlparse(resp_url)
-                    js_files.append({
-                        "url":      resp_url,
-                        "domain":   parsed.netloc,
-                        "path":     parsed.path,
-                        "resource": "script",
-                    })
-            except Exception:
-                pass
+        def on_response(resp):
+    try:
+        rurl = resp.url
+        path = urlparse(rurl).path.lower()
+        if rurl not in seen and (
+            path.endswith(".js") or path.endswith(".mjs") or ".js?" in path
+        ):
+            seen.add(rurl)
+            parsed = urlparse(rurl)
+            js_files.append({
+                "url":      rurl,
+                "domain":   parsed.netloc,
+                "path":     path,
+                "resource": "script",
+            })
+    except Exception:
+        pass
 
-        page.on("response", on_response)
+page.on("response", on_response)
 
         # ── Navega com wait_until="load" (mais tolerante) ────────────────────
         logger.info("  🌐 Browser → %s", url)
