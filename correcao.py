@@ -514,7 +514,9 @@ async def collect_js(url: str, timeout_s: int, wait_s: int,
 
         logger.info("  🌐 Abrindo %s", url)
         try:
-            await page.goto(url, timeout=timeout_s * 1000, wait_until="networkidle")
+            #await page.goto(url, timeout=timeout_s * 1000, wait_until="networkidle")
+            await page.goto(url, timeout=timeout_s * 1000, wait_until="load")
+
         except Exception as e:
             logger.warning("  [nav] %s — continuando", e)
 
