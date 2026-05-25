@@ -380,6 +380,60 @@ def httpx_probe(open_ports: dict[str, list[int]], out: Path,
 # FASE 1-D: COLETA DE JS (ferramentas)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _collect_js_single(domain: str, alive_urls: list[str],
+                       lg: logging.Logger) -> set[str]:
+    """
+    Coleta de JS apenas no domínio exato — sem expandir para subdomínios.
+    Usado pelo modo --single-target.
+    """
+    js: set[str] = set()
+    clog(lg, "\n━━━ Coleta de JS (single-target) ━━━", C.BLUE + C.BOLD)
+
+    # gau: sem --subs para não puxar subdomínios
+    if tool_ok("gau"):
+        lines = run_cmd(["gau", "--blacklist",
+                         "png,jpg,gif,svg,css,woff,woff2,ttf,eot,mp4",
+                         domain], lg, timeout=300)
+        before = len(js)
+        for l in lines:
+            if ".js" in urlparse(l).path.lower() and not _CDN_RE.search(l):
+                js.add(l.strip())
+        clog(lg, f"  gau: +{len(js)-before}", C.GREEN)
+
+    # waybackurls: já é por domínio exato por padrão
+    if tool_ok("waybackurls"):
+        lines = run_cmd(["waybackurls", domain], lg, timeout=300)
+        before = len(js)
+        for l in lines:
+            if ".js" in urlparse(l).path.lower() and not _CDN_RE.search(l):
+                js.add(l.strip())
+        clog(lg, f"  waybackurls: +{len(js)-before}", C.GREEN)
+
+    # gospider: só nas URLs do domínio principal (não subdomínios)
+    if tool_ok("gospider"):
+        before = len(js)
+        # Filtra só urls do domínio exato
+        domain_urls = [u for u in alive_urls
+                       if urlparse(u).netloc.lower().split(":")[0] == domain.lower()]
+        for url in domain_urls[:10]:
+            lines = run_cmd(
+                ["gospider", "-s", url, "-d", "2", "-t", "5", "--js", "--quiet"],
+                lg, timeout=120)
+            for l in lines:
+                m = re.search(r'https?://[^\s"\'<>]+\.js\b[^\s"\'<>]*', l)
+                if m and not _CDN_RE.search(m.group(0)):
+                    # Só aceita JS do domínio exato
+                    js_host = urlparse(m.group(0)).netloc.lower().split(":")[0]
+                    if js_host == domain.lower():
+                        js.add(m.group(0))
+        clog(lg, f"  gospider: +{len(js)-before}", C.GREEN)
+
+    js = {u for u in js if not u.endswith(".js.map")}
+    clog(lg, f"  Total JS (single-target): {len(js)}", C.GREEN + C.BOLD)
+    return js
+
+
+
 def collect_js_tools(domain: str, alive_urls: list[str],
                      lg: logging.Logger) -> set[str]:
     js: set[str] = set()
@@ -1441,7 +1495,8 @@ Variáveis de ambiente:
     p.add_argument("--skip-recon",   action="store_true",
                    help="Pula recon (usa endpoints.jsonl existente)")
     p.add_argument("--no-nmap",      action="store_true", help="Pula nmap")
-    p.add_argument("--no-subs",      action="store_true", help="Pula enum de subdomínios")
+    p.add_argument("--single-target",  action="store_true",
+                   help="Só o domínio passado — sem enum de subdomínios, sem nmap, sem gospider/katana em subdomínios")
     p.add_argument("--no-live",      action="store_true", help="Pula Playwright")
     p.add_argument("--no-oob",       action="store_true", help="Pula injeção OOB")
     p.add_argument("--no-cache",     action="store_true", help="Ignora cache de JS")
@@ -1530,23 +1585,41 @@ def main() -> None:
         clog(lg, f"  Recon pulado. {len(endpoints)} endpoints carregados.", C.YELLOW)
         confirmed_hosts: set[str] = set()   # não disponível sem recon
     else:
+        # ── Modo single-target: pula tudo que expande o escopo ────────────
+        single = getattr(args, "single_target", False)
+
+        if single:
+            clog(lg, f"\n  Modo single-target: apenas {domain} (sem subdomínios, sem nmap)",
+                 C.YELLOW + C.BOLD)
+
         # 1-A: Subdomínios
-        subs = {domain} if args.no_subs else enum_subdomains(domain, out, lg)
+        if single or args.no_subs:
+            subs = {domain}
+            _write(out / "subdomains.txt", [domain], lg)
+        else:
+            subs = enum_subdomains(domain, out, lg)
 
         # 1-B: Nmap
-        open_ports = ({s: [80, 443] for s in subs} if args.no_nmap
-                      else nmap_scan(subs, out, lg))
+        if single or args.no_nmap:
+            # Single-target: assume 80 e 443 para não demorar
+            open_ports = {domain: [80, 443]}
+        else:
+            open_ports = nmap_scan(subs, out, lg)
 
-        # 1-C: httpx
+        # 1-C: httpx — valida se o domínio está vivo
         alive_urls, confirmed_hosts = httpx_probe(open_ports, out, lg)
         if not alive_urls:
             clog(lg, "Nenhum host vivo. Encerrando.", C.RED, "error")
             sys.exit(0)
 
         # 1-D: Coleta de JS
-        js_from_tools = collect_js_tools(domain, alive_urls, lg)
+        # Single-target: gau/waybackurls só no domínio exato (sem --subs)
+        if single:
+            js_from_tools = _collect_js_single(domain, alive_urls, lg)
+        else:
+            js_from_tools = collect_js_tools(domain, alive_urls, lg)
 
-        # 1-E: Playwright
+        # 1-E: Playwright — single-target só abre o domínio raiz
         js_from_browser: set[str] = set()
         if not args.no_live and HAS_PLAYWRIGHT:
             clog(lg, "\n━━━ Playwright ━━━", C.BLUE + C.BOLD)
@@ -1554,6 +1627,9 @@ def main() -> None:
             targets = []
             for url in alive_urls:
                 parsed = urlparse(url)
+                # Single-target: ignora subdomínios que o httpx possa ter retornado
+                if single and parsed.netloc.lower().split(":")[0] != domain.lower():
+                    continue
                 key = parsed.netloc
                 if key not in seen_hosts:
                     seen_hosts.add(key)
