@@ -1028,19 +1028,46 @@ def inject_endpoint(ep: dict, oob_host: str, plog: PayloadLog,
     base_url = ep["absolute_url"]
     sent     = 0
 
-    # Normaliza método para requests
-    req_method = method if method in ("GET","POST","PUT","PATCH","DELETE") else "GET"
+    # ── Normaliza método para requests ────────────────────────────────────
+    # ANY/DYNAMIC: infere pelo path e label, não assume GET por padrão
+    #   /api/*, /submit-*, /create-*, /send-* → POST
+    #   Tem body_params → POST
+    #   Tem query_params ou path com ? → GET
+    #   Fallback → tenta GET e POST
+    if method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        req_method = method
+    else:
+        label      = ep.get("label", "").lower()
+        path_lower = base_url.lower()
+        has_body   = bool(ep.get("body_params"))
+        has_qs     = "?" in base_url
 
-    # ── 1. Injeção nos query params ───────────────────────────────────────
+        if has_body:
+            req_method = "POST"
+        elif "post" in label or "graphql" in label:
+            req_method = "POST"
+        elif re.search(r'/(?:submit|create|send|add|new|register|login|auth|upload|update)', path_lower):
+            req_method = "POST"
+        elif has_qs:
+            req_method = "GET"
+        else:
+            # Sem pistas — tenta POST (APIs sem QS geralmente recebem body)
+            req_method = "POST"
+
+    # Indica ao log qual método foi inferido
+    method_display = req_method if method in ("GET","POST","PUT","PATCH","DELETE") \
+                     else f"{req_method}(≈{method})"
+
+    # ── 1. Injeção nos query params / body ────────────────────────────────
     params_from_qs = []
     if "?" in base_url:
         qs = urllib.parse.urlparse(base_url).query
         params_from_qs = list(urllib.parse.parse_qs(qs, keep_blank_values=True).keys())
 
-    # Adiciona body params (POST/PUT/PATCH)
     body_params = ep.get("body_params", [])
 
-    # Une todos os params conhecidos
+    # Params de QS → injeta na URL; body params → injeta no JSON body
+    # Se não tiver nenhum, usa "q" como placeholder para tentar
     all_params = list(dict.fromkeys(params_from_qs + body_params)) or ["q"]
 
     for param in all_params:
@@ -1048,37 +1075,39 @@ def inject_endpoint(ep: dict, oob_host: str, plog: PayloadLog,
         for category, tpl in payloads:
             uid     = unique_id(category, param)
             payload = tpl.replace("{OOB}", oob_host).replace("{ID}", uid)
-
             sent_at = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-            # Monta URL/body com payload
-            if param in params_from_qs:
+            # GET → payload na URL; POST/PUT/PATCH → payload no body
+            if req_method == "GET" or param in params_from_qs:
                 injected_url = _inject_param(base_url, param, payload)
                 body_data    = None
             else:
-                # Body param
+                # Param é body param — manda via JSON
                 injected_url = base_url
-                body_data    = {p: (payload if p == param else f"<{p}>")
-                                for p in body_params}
+                body_data    = {
+                    p: (payload if p == param else f"<{p}>")
+                    for p in (body_params or [param])
+                }
 
             headers = {
-                "User-Agent": "Mozilla/5.0 (compatible; jsrecon_oob/1.0)",
-                "Accept":     "application/json, */*",
+                "User-Agent":   "Mozilla/5.0 (compatible; jsrecon_oob/1.0)",
+                "Accept":       "application/json, */*",
             }
-            curl_cmd = _build_curl_cmd(injected_url, req_method, headers, body_data)
 
             plog.record(uid, base_url, param, category, payload)
-            code = _send_request(injected_url, req_method, headers,
-                                  body_data if method in ("POST","PUT","PATCH") else None)
+            code = _send_request(injected_url, req_method, headers, body_data)
 
             clog(lg,
                  f"  {sent_at} [{uid[:32]}] "
-                 f"{param:15} {category:10} HTTP {code} → {base_url[:55]}",
+                 f"{param:15} {category:10} "
+                 f"[{method_display}] HTTP {code} → {base_url[:50]}",
                  C.GREEN if code in ("200","201","301","302") else C.DIM)
             sent += 1
             time.sleep(delay)
 
     # ── 2. Injeção nos headers HTTP ───────────────────────────────────────
+    # Headers são enviados com o método correto do endpoint
+    # POST endpoints continuam sendo POST, GET continuam GET
     for hdr_name, hdr_tpl in OOB_HEADERS:
         uid      = unique_id("hdr", re.sub(r'[^a-z0-9]', '', hdr_name.lower())[:6])
         payload  = hdr_tpl.replace("{OOB}", oob_host).replace("{ID}", uid)
@@ -1090,15 +1119,23 @@ def inject_endpoint(ep: dict, oob_host: str, plog: PayloadLog,
             "Accept":     "application/json, */*",
             hdr_name:     payload,
         }
+
+        # body_data para headers: POST mantém body mínimo para não virar 400
+        hdr_body = ({"_": ""} if req_method in ("POST", "PUT", "PATCH")
+                    and body_params
+                    else None)
+
         plog.record(uid, base_url, hdr_name, category, payload)
-        code = _send_request(base_url, req_method, headers)
+        # Bug fix: body era argumento posicional obrigatório, agora sempre passado
+        code = _send_request(base_url, req_method, headers, hdr_body)
 
         clog(lg,
              f"  {sent_at} [{uid[:32]}] "
-             f"{hdr_name:25} header      HTTP {code} → {base_url[:40]}",
+             f"{hdr_name:25} header      "
+             f"[{method_display}] HTTP {code} → {base_url[:35]}",
              C.DIM)
         sent += 1
-        time.sleep(delay * 0.3)   # headers: delay reduzido
+        time.sleep(delay * 0.3)
 
     return sent
 
