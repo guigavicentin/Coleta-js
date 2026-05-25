@@ -1526,15 +1526,38 @@ Variáveis de ambiente:
 def main() -> None:
     args = parse_args()
 
-    domain = args.domain.strip()
-    for pfx in ("https://", "http://"):
-        if domain.startswith(pfx):
-            domain = domain[len(pfx):]
-    domain = domain.rstrip("/")
+    raw_input = args.domain.strip().rstrip("/")
 
+    # ── Extrai scheme, host e porta do input ──────────────────────────────
+    # Aceita: target.com  |  target.com:8443  |  https://target.com
+    #         https://target.com:8443  |  http://target.com:9000
+    forced_scheme: str = ""
+    forced_port:   int = 0
+
+    parsed_input = urlparse(raw_input if "://" in raw_input else f"placeholder://{raw_input}")
+    forced_scheme = parsed_input.scheme if parsed_input.scheme not in ("", "placeholder") else ""
+    domain        = parsed_input.hostname or raw_input.split(":")[0]
+    forced_port   = parsed_input.port or 0
+
+    # Valida host
     if not re.match(r'^[a-zA-Z0-9.\-]+$', domain):
-        print(f"Domínio inválido: {domain}")
+        print(f"Domínio/host inválido: {domain}")
         sys.exit(1)
+
+    # Monta label legível para logs
+    if forced_scheme and forced_port:
+        target_label = f"{forced_scheme}://{domain}:{forced_port}"
+    elif forced_scheme:
+        target_label = f"{forced_scheme}://{domain}"
+    elif forced_port:
+        target_label = f"{domain}:{forced_port}"
+    else:
+        target_label = domain
+
+    # ── Se porta/scheme forçados: single-target automático ───────────────
+    # Não faz sentido enumerar subdomínios se o usuário passou uma porta específica
+    if forced_port or forced_scheme:
+        args.single_target = True
 
     out = Path(args.output_dir or f"jsrecon_oob_{domain.replace('.','_')}")
     out.mkdir(parents=True, exist_ok=True)
@@ -1550,7 +1573,11 @@ def main() -> None:
     }
 
     clog(lg, f"\n{'═'*66}", C.CYAN + C.BOLD)
-    clog(lg, f"  jsrecon_oob  —  alvo: {domain}", C.CYAN + C.BOLD)
+    clog(lg, f"  jsrecon_oob  —  alvo: {target_label}", C.CYAN + C.BOLD)
+    if forced_scheme:
+        clog(lg, f"  Scheme     : {forced_scheme} (forçado)", C.CYAN)
+    if forced_port:
+        clog(lg, f"  Porta      : {forced_port} (forçada)", C.CYAN)
     if args.oob:
         clog(lg, f"  OOB host   : {args.oob}", C.CYAN)
     clog(lg, f"  Saída      : {out}/", C.CYAN)
@@ -1601,8 +1628,16 @@ def main() -> None:
 
         # 1-B: Nmap
         if single or args.no_nmap:
-            # Single-target: assume 80 e 443 para não demorar
-            open_ports = {domain: [80, 443]}
+            # Usa porta forçada se o usuário passou (ex: https://host:8443)
+            # Senão assume 80 e 443
+            if forced_port:
+                open_ports = {domain: [forced_port]}
+            elif forced_scheme == "https":
+                open_ports = {domain: [443]}
+            elif forced_scheme == "http":
+                open_ports = {domain: [80]}
+            else:
+                open_ports = {domain: [80, 443]}
         else:
             open_ports = nmap_scan(subs, out, lg)
 
