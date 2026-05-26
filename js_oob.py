@@ -1745,6 +1745,8 @@ Variáveis de ambiente:
     p.add_argument("--no-nmap",      action="store_true", help="Pula nmap")
     p.add_argument("--single-target",  action="store_true",
                    help="Só o domínio passado — sem enum de subdomínios, sem nmap, sem gospider/katana em subdomínios")
+    p.add_argument("--no-subs",      action="store_true",
+                  help="Pula enumeração de subdomínios")
     p.add_argument("--no-live",      action="store_true", help="Pula Playwright")
     p.add_argument("--no-oob",       action="store_true", help="Pula injeção OOB")
     p.add_argument("--no-cache",     action="store_true", help="Ignora cache de JS")
