@@ -536,16 +536,24 @@ async def playwright_all(targets: list[str], headless: bool,
     return all_js
 
 # ─── Fase 2: Filtro de endpoints ─────────────────────────────────────────────
-_TMPL_LITERAL = re.compile(r'\$\{[^}]*\}')
-_JS_CONCAT    = re.compile(r'"\s*\+\s*\w|\w\s*\+\s*"')
-_STATIC_EXT   = re.compile(
+_TMPL_LITERAL  = re.compile(r'\$\{[^}]*\}')
+_JS_CONCAT     = re.compile(r'"\s*\+\s*\w|\w\s*\+\s*"')
+_STATIC_EXT    = re.compile(
     r'\.(png|jpg|jpeg|gif|ico|svg|webp|woff|woff2|ttf|eot|css|map|txt|pdf|zip|gz)$',
     re.I
 )
-_ASSET_PATH   = re.compile(
+_ASSET_PATH    = re.compile(
     r'(?:/__webpack|/static/|/assets/|/dist/|/build/|\.chunk\.js|\.bundle\.js)',
     re.I
 )
+# Filtros adicionais de qualidade de endpoints
+_TRAILING_JUNK = re.compile(r'[\\)\]]+$')          # \\ ) ] no final do path
+_BUILD_PATH    = re.compile(                           # paths de build/CI/filesystem
+    r'/(?:node_modules|builds/|src/locales|src/pages|\.cache)',
+    re.I
+)
+_STATUS_CODE   = re.compile(r'^/\d{3}$')             # /404, /412, /200 etc
+_TOO_SHORT     = re.compile(r'^/[a-zA-Z0-9_]{1,3}$')  # /tmp, /mod, /js
 
 def is_valid_endpoint(path: str, target_domain: str,
                       confirmed_hosts: set[str]) -> tuple[bool, str]:
@@ -555,11 +563,27 @@ def is_valid_endpoint(path: str, target_domain: str,
         return False, "js_template_literal"
     if _JS_CONCAT.search(path):
         return False, "js_concat"
+
+    # Remove lixo de extração: \\ ) ] no final do path
+    path = _TRAILING_JUNK.sub("", path).rstrip("/") or path
+
     clean_path = path.split("?")[0]
     if _STATIC_EXT.search(clean_path):
         return False, "static_asset"
     if _ASSET_PATH.search(path):
         return False, "framework_asset"
+
+    # Paths de build/filesystem/CI — nunca são endpoints de API
+    if _BUILD_PATH.search(path):
+        return False, "build_path"
+
+    # Status codes HTTP como paths: /404, /412, /200
+    if _STATUS_CODE.match(path):
+        return False, "status_code_path"
+
+    # Paths muito curtos: /tmp, /mod, /js, /en
+    if _TOO_SHORT.match(path):
+        return False, "too_short_path"
 
     if path.startswith(("http://", "https://", "ws://", "wss://")):
         try:
@@ -609,6 +633,12 @@ def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
         ("fetch_delete",    re.compile(rf'(?:axios\.delete|http\.delete)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "DELETE"),
         ("fetch_patch",     re.compile(rf'(?:axios\.patch|http\.patch)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "PATCH"),
         ("fetch_method",    re.compile(rf'fetch\s*\(\s*{Q}({NQ}{{3,}}){Q}\s*,\s*\{{[^}}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
+        # fetch_baseurl: extrai sufixo de path de template literals com baseURL variável
+        # Ex: axios.get(`${base}/v1/teams/`)      →  /v1/teams/
+        # Ex: this.api.get(`${this.url}/v2/apps`) →  /v2/apps
+        ("fetch_baseurl",  re.compile(r'(?:fetch|axios\.(?:get|post|put|patch|delete)|this\.\w+\.(?:get|post|put|patch))\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}(?:\$\{[^}]*\}[a-zA-Z0-9/_\-]*)*)\x60', I), "ANY"),
+        # fetch_baseurl_m: idem com { method: 'POST' }
+        ("fetch_baseurl_m",re.compile(r'fetch\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}[^\x60]*)\x60\s*,\s*\{[^}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
         ("xhr_open",        re.compile(rf'\.open\s*\(\s*[\x22\x27](\w+)[\x22\x27]\s*,\s*{Q}({NQ}{{3,}}){Q}', I), "XHR"),
         ("api_versioned",   re.compile(rf'{Q}(/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s\x22\x27\x60]*)?){Q}'), "ANY"),
         ("graphql",         re.compile(rf'{Q}((?:/graphql|/gql)(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "POST"),
@@ -651,6 +681,7 @@ _GET_LABELS: set[str] = {
     "fetch_get", "api_versioned", "versioned_path",
     "router_path", "href_action", "url_with_query",
     "generic_path", "path_param_ssrf", "iframe_src",
+    "fetch_baseurl",   # template literal com baseURL variável → GET por padrão
 }
 _POST_LABELS: set[str] = {
     "fetch_post", "fetch_put", "fetch_patch",
@@ -722,6 +753,13 @@ def analyze_js_content(content: str, js_url: str,
 
             if not path:
                 continue
+
+            # fetch_baseurl: mantém só parte fixa antes de ${varId}
+            # Ex: /v1/apps/${appId}/settings → /v1/apps
+            if label in ("fetch_baseurl", "fetch_baseurl_m") and _TMPL_LITERAL.search(path):
+                path = _TMPL_LITERAL.split(path)[0].rstrip("/") or path
+                if not path or len(path) < 3:
+                    continue
 
             valid, reason = is_valid_endpoint(path, target_domain, confirmed_hosts)
             if not valid:
