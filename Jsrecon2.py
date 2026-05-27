@@ -102,9 +102,15 @@ _CDN_RE = re.compile(
     re.I,
 )
 
-# FIX: filtro de template literals JS — evita que fetch(`/api/${id}`) gere
-# endpoints inválidos como '/api/${id}/data' que poluem o output.
-_TMPL_LITERAL = re.compile(r'\$\{[^}]*\}')
+# Filtros de qualidade para is_valid_endpoint
+_TMPL_LITERAL  = re.compile(r'\$\{[^}]*\}')       # template literal com variável
+_TRAILING_JUNK = re.compile(r'[\\)\]]+$')          # \ ) ] no final do path
+_BUILD_PATH    = re.compile(                          # paths de build/CI/filesystem
+    r'/(?:node_modules|builds/|src/locales|src/pages|\.cache)',
+    re.I
+)
+_STATUS_CODE   = re.compile(r'^/\d{3}$')            # /404, /412, /200 etc
+_TOO_SHORT     = re.compile(r'^/[a-zA-Z0-9_]{1,3}$') # /tmp, /mod, /js
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers gerais
@@ -317,9 +323,14 @@ def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
         ("fetch_delete",   re.compile(rf'(?:axios\.delete|http\.delete|this\.\$http\.delete)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "DELETE"),
         ("fetch_patch",    re.compile(rf'(?:axios\.patch|http\.patch|this\.\$http\.patch)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "PATCH"),
         ("fetch_method",   re.compile(rf'fetch\s*\(\s*{Q}({NQ}{{3,}}){Q}\s*,\s*\{{[^}}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
-        # FIX: fetch_template agora só captura literais sem ${...} — template
-        # literals com variáveis (${ }) são descartados no filtro posterior.
-        ("fetch_template", re.compile(r'(?:fetch|axios\.(?:get|post|put|patch|delete))\s*\(\s*\x60([^\x60]{3,})\x60', I), "ANY"),
+        # fetch_template: captura backtick strings SEM variável (path literal completo)
+        ("fetch_template", re.compile(r'(?:fetch|axios\.(?:get|post|put|patch|delete))\s*\(\s*\x60([^\x60$]{3,})\x60', I), "ANY"),
+        # fetch_baseurl: extrai sufixo de path de template literals com baseURL variável
+        # Ex: axios.get(`${base}/v1/teams/`)      →  /v1/teams/
+        # Ex: this.api.get(`${this.url}/v2/apps`) →  /v2/apps
+        ("fetch_baseurl",  re.compile(r'(?:fetch|axios\.(?:get|post|put|patch|delete)|this\.\w+\.(?:get|post|put|patch))\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}(?:\$\{[^}]*\}[a-zA-Z0-9/_\-]*)*)\x60', I), "ANY"),
+        # fetch_baseurl_m: idem com { method: 'POST' }
+        ("fetch_baseurl_m",re.compile(r'fetch\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}[^\x60]*)\x60\s*,\s*\{[^}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
         ("xhr_open",       re.compile(rf'\.open\s*\(\s*[\x22\x27](\w+)[\x22\x27]\s*,\s*{Q}({NQ}{{3,}}){Q}', I), "XHR"),
         ("api_versioned",  re.compile(rf'{Q}(/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s\x22\x27\x60]*)?){Q}'), "ANY"),
         ("graphql",        re.compile(rf'{Q}((?:/graphql|/gql)(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "POST"),
@@ -357,14 +368,29 @@ def is_valid_endpoint(path: str, root_domain: str,
     if not path or len(path) < 3:
         return False, "too_short"
 
-    # FIX: descarta template literals JS — fetch(`/api/${id}`) é inválido como endpoint
+    # Descarta template literals com variável no path (fetch_baseurl já extrai a parte fixa)
     if _TMPL_LITERAL.search(path):
         return False, "js_template_literal"
+
+    # Remove lixo de extração: \\ ) ] no final do path
+    path = _TRAILING_JUNK.sub("", path).rstrip("/") or path
 
     # Extensões estáticas
     clean_path = path.split("?")[0]
     if _STATIC_EXT.search(clean_path):
         return False, "static_asset"
+
+    # Paths de build/filesystem/CI
+    if _BUILD_PATH.search(path):
+        return False, "build_path"
+
+    # Status codes HTTP como paths: /404, /412, /200
+    if _STATUS_CODE.match(path):
+        return False, "status_code_path"
+
+    # Paths muito curtos: /tmp, /mod, /js, /en
+    if _TOO_SHORT.match(path):
+        return False, "too_short_path"
 
     # Paths que são claramente variáveis JS
     if re.match(r'^\$\{|^\${|^#|^\.|^//|^/\*', path):
@@ -572,6 +598,13 @@ def analyze_js(content: str, js_url: str, cfg: dict, logger: logging.Logger) -> 
 
             # FIX: validação centralizada que inclui filtro de template literals,
             # extensões estáticas e verificação de domínio.
+            # fetch_baseurl: mantém só parte fixa antes de ${varId}
+            # Ex: /v1/apps/${appId}/settings → /v1/apps
+            if label in ("fetch_baseurl", "fetch_baseurl_m") and _TMPL_LITERAL.search(path):
+                path = _TMPL_LITERAL.split(path)[0].rstrip("/") or path
+                if not path or len(path) < 3:
+                    continue
+
             valid, reason = is_valid_endpoint(path, root_domain, confirmed_hosts)
             if not valid:
                 logger.debug("[DROP][%s] %s ← %s", reason, path[:80], js_url)
@@ -1084,7 +1117,11 @@ _METHOD_NORMALIZE = {
 
 
 def _build_curl(ep: dict) -> str:
-    method = ep.get("method", "GET")
+    raw_method = ep.get("method", "GET").upper()
+    # FIX: normaliza método — ANY/DYNAMIC/XHR/WS não são métodos HTTP válidos
+    _CURL_METHOD = {"ANY": "GET", "DYNAMIC": "POST", "XHR": "GET", "WS": "GET"}
+    method = _CURL_METHOD.get(raw_method, raw_method)
+
     url    = ep.get("absolute_url", "")
     parts  = [f"curl -sk -o /dev/null -w '%{{http_code}} %{{size_download}} %{{time_total}}'"]
     parts.append(f"-X {method}")
@@ -1096,8 +1133,11 @@ def _build_curl(ep: dict) -> str:
         parts.append("-H 'Content-Type: application/json'")
         parts.append(f"-d '{json.dumps(body)}'")
     elif ep.get("query_params"):
-        sep = "&" if "?" in url else "?"
-        url = url + sep + ep["query_params"]
+        # FIX: só adiciona qs se não estiver já na URL (evita ?cat=FOOD&cat=FOOD)
+        qs = ep["query_params"]
+        if qs and qs not in url:
+            sep = "&" if "?" in url else "?"
+            url = url + sep + qs
 
     parts.append(f"'{url}'")
     return " ".join(parts)
