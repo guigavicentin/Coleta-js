@@ -1991,7 +1991,9 @@ def main() -> None:
                 key = parsed.netloc
                 if key not in seen_hosts:
                     seen_hosts.add(key)
-                    targets.append(f"{parsed.scheme}://{parsed.netloc}")
+                    # FIX: usa URL completa com path (ex: https://host:5001/api/v1/)
+                    # Antes descartava o path — páginas sem ele podem retornar 404.
+                    targets.append(url)
             js_from_browser = asyncio.run(
                 playwright_all(targets, not args.no_headless, lg)
             )
