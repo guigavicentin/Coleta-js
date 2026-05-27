@@ -191,17 +191,32 @@ class Target:
             self.port    = raw_parsed.port or 0
             self.path    = raw_parsed.path or ""
 
-        # URL base para coleta direta (sem subfinder/nmap)
+        # URL base para coleta direta (sem subfinder/nmap).
+        # FIX: preserva o path quando fornecido (ex: /sysmo-broadcast-api/api/).
+        # O Playwright e as ferramentas de crawl precisam abrir a URL exata
+        # fornecida pelo usuário — sem o path, podem cair numa página vazia/404.
+        path_suffix = self.path.rstrip("/") if self.path and self.path != "/" else ""
+
         if self.scheme and self.port:
-            self.base_url = f"{self.scheme}://{self.host}:{self.port}"
+            self.base_url = f"{self.scheme}://{self.host}:{self.port}{path_suffix}"
         elif self.scheme:
-            self.base_url = f"{self.scheme}://{self.host}"
+            self.base_url = f"{self.scheme}://{self.host}{path_suffix}"
         elif self.port:
-            # porta sem scheme — assume https para portas conhecidas
             s = "https" if self.port in HTTPS_PORTS else "http"
-            self.base_url = f"{s}://{self.host}:{self.port}"
+            self.base_url = f"{s}://{self.host}:{self.port}{path_suffix}"
         else:
             self.base_url = ""
+
+        # base sem path — usado para montar URLs absolutas de endpoints
+        if self.scheme and self.port:
+            self.origin = f"{self.scheme}://{self.host}:{self.port}"
+        elif self.scheme:
+            self.origin = f"{self.scheme}://{self.host}"
+        elif self.port:
+            s = "https" if self.port in HTTPS_PORTS else "http"
+            self.origin = f"{s}://{self.host}:{self.port}"
+        else:
+            self.origin = ""
 
         # Se veio com URL completa, é single-target automaticamente
         self.is_single = bool(self.scheme or self.port)
@@ -1017,10 +1032,14 @@ def collect_all_js(
                 # FIX: single_target — só abre o host exato, ignora subdomínios
                 if single_target and parsed.netloc.lower().split(":")[0] != cfg["domain"].lower():
                     continue
+                # FIX: usa a URL completa incluindo path (ex: https://host:5001/api/v1/)
+                # Antes montava só scheme://netloc, descartando o path fornecido pelo usuário.
+                # Dedup por netloc — evita abrir o mesmo host duas vezes se alive_urls
+                # tiver variações de porta, mas preserva a primeira URL com path.
                 key = parsed.netloc
                 if key not in seen_targets:
                     seen_targets.add(key)
-                    targets.append(f"{parsed.scheme}://{parsed.netloc}")
+                    targets.append(url)
 
             logger.info("[browser] %d alvos únicos", len(targets))
             browser_js = asyncio.run(live_crawl_all(targets, cfg, logger))
@@ -1686,15 +1705,18 @@ def run_target(target: Target, args: argparse.Namespace,
 
     # ── 1. Single-target: gera alive_urls diretamente da URL fornecida
     if target.is_single:
-        base = target.base_url
-        alive_urls     = [base] if base else [f"https://{domain}"]
+        # FIX: usa base_url que preserva o path (ex: https://host:5001/api/v1/).
+        # O Playwright e os crawlers precisam abrir a URL exata para encontrar
+        # o JS correto — sem o path a página pode ser 404 ou vazia.
+        base = target.base_url or f"https://{domain}"
+        alive_urls      = [base]
         confirmed_hosts: set[str] = {domain}
-        subs           = {domain}
-        stats["subs"]  = 1
-        stats["alive"] = len(alive_urls)
+        subs            = {domain}
+        stats["subs"]   = 1
+        stats["alive"]  = len(alive_urls)
         _write(cfg["subs_file"],  [domain], logger)
         _write(cfg["alive_file"], alive_urls, logger)
-        logger.info("Single-target: usando %s diretamente.", base or domain)
+        logger.info("Single-target: abrindo %s diretamente.", base)
 
     else:
         # ── 1. Subdomínios ────────────────────────────────────────────────────
