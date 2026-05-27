@@ -21,8 +21,11 @@ Fluxo:
 
 Uso:
     python3 jsrecon2.py target.com.br
+    python3 jsrecon2.py https://api.target.com:8443           (URL completa com porta)
+    python3 jsrecon2.py targets.txt                           (arquivo com um alvo por linha)
     python3 jsrecon2.py target.com.br --no-nmap --workers 30
     python3 jsrecon2.py target.com.br --no-subs --no-validate
+    python3 jsrecon2.py target.com.br --skip-recon            (reutiliza endpoints.jsonl)
     python3 jsrecon2.py target.com.br --no-headless
 """
 
@@ -45,7 +48,7 @@ import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from tenacity import (
@@ -56,12 +59,13 @@ from tenacity import (
     wait_exponential,
 )
 
+# FIX: Playwright como import condicional — sys.exit(1) no topo impedia rodar
+# com --no-live em ambientes sem o browser instalado.
 try:
     from playwright.async_api import async_playwright
+    HAS_PLAYWRIGHT = True
 except ImportError:
-    print("[ERRO] Playwright não instalado. Execute:")
-    print("       pip install playwright && playwright install chromium")
-    sys.exit(1)
+    HAS_PLAYWRIGHT = False
 
 try:
     import jsbeautifier
@@ -76,13 +80,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ─────────────────────────────────────────────────────────────────────────────
 
 HTTP_PORTS = [
-    80, 81, 443, 3000, 3001, 4000, 4443, 5000, 5432, 5900,
+    80, 81, 443, 3000, 3001, 4000, 4443, 5000, 5001, 5432, 5900,
     6000, 6443, 6885, 7077, 8000, 8080, 8081, 8181, 8443,
     9000, 9091, 9443, 9999, 10000, 15672, 161, 2075, 2076,
     3306, 3366, 3868, 4044,
 ]
 NMAP_PORTS   = ",".join(str(p) for p in sorted(set(HTTP_PORTS)))
-HTTPS_PORTS  = {443, 8443, 9443, 4443, 6443, 2076, 10000}
+HTTPS_PORTS  = {443, 8443, 9443, 4443, 6443, 2076, 10000, 5001}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CDN — descartados antes de qualquer análise
@@ -97,6 +101,10 @@ _CDN_RE = re.compile(
     r'fonts\.googleapis\.com|fonts\.gstatic\.com)',
     re.I,
 )
+
+# FIX: filtro de template literals JS — evita que fetch(`/api/${id}`) gere
+# endpoints inválidos como '/api/${id}/data' que poluem o output.
+_TMPL_LITERAL = re.compile(r'\$\{[^}]*\}')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers gerais
@@ -162,6 +170,79 @@ def _append(path: Path, line: str) -> None:
         f.write(line + "\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX: Parse de alvo — aceita domínio, URL completa com porta e arquivo .txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Target:
+    """Representa um alvo normalizado."""
+    def __init__(self, raw: str):
+        raw = raw.strip().rstrip("/")
+        # Garante scheme para urlparse funcionar
+        if "://" not in raw:
+            raw_parsed = urlparse(f"placeholder://{raw}")
+            self.scheme  = ""
+            self.host    = raw_parsed.hostname or raw.split(":")[0]
+            self.port    = raw_parsed.port or 0
+            self.path    = raw_parsed.path or ""
+        else:
+            raw_parsed   = urlparse(raw)
+            self.scheme  = raw_parsed.scheme
+            self.host    = raw_parsed.hostname or ""
+            self.port    = raw_parsed.port or 0
+            self.path    = raw_parsed.path or ""
+
+        # URL base para coleta direta (sem subfinder/nmap)
+        if self.scheme and self.port:
+            self.base_url = f"{self.scheme}://{self.host}:{self.port}"
+        elif self.scheme:
+            self.base_url = f"{self.scheme}://{self.host}"
+        elif self.port:
+            # porta sem scheme — assume https para portas conhecidas
+            s = "https" if self.port in HTTPS_PORTS else "http"
+            self.base_url = f"{s}://{self.host}:{self.port}"
+        else:
+            self.base_url = ""
+
+        # Se veio com URL completa, é single-target automaticamente
+        self.is_single = bool(self.scheme or self.port)
+
+        # Label para logs e nome de pasta
+        if self.scheme and self.port:
+            self.label = f"{self.scheme}://{self.host}:{self.port}"
+        elif self.scheme:
+            self.label = f"{self.scheme}://{self.host}"
+        elif self.port:
+            self.label = f"{self.host}:{self.port}"
+        else:
+            self.label = self.host
+
+    def __repr__(self):
+        return f"Target({self.label})"
+
+    def safe_dirname(self) -> str:
+        """Nome de pasta seguro."""
+        return re.sub(r'[^\w.\-]', '_', self.label)
+
+
+def load_targets(raw_arg: str) -> list[Target]:
+    """
+    Carrega lista de alvos a partir de:
+      - arquivo .txt (um alvo por linha, # = comentário)
+      - string direta (domínio ou URL)
+    """
+    p = Path(raw_arg)
+    if p.exists() and p.is_file():
+        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        targets = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            targets.append(Target(line))
+        return targets
+    return [Target(raw_arg)]
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Filtro de domínio alvo
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -206,54 +287,98 @@ def filter_target_js(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Padrões de endpoints (ricos)
+# Padrões de endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
-    # Q  = qualquer aspas: " ' `
-    # NQ = qualquer char exceto aspas e espaço
     Q  = r'[\x22\x27\x60]'
     NQ = r'[^\x22\x27\x60\s]'
     I  = re.I
     ID = re.I | re.DOTALL
     return [
-        # ── fetch / axios / http ─────────────────────────────────────────────
         ("fetch_get",      re.compile(rf'(?:fetch|axios\.get|http\.get|this\.\$http\.get|this\.http\.get)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "GET"),
         ("fetch_post",     re.compile(rf'(?:fetch|axios\.post|http\.post|this\.\$http\.post|this\.http\.post)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "POST"),
         ("fetch_put",      re.compile(rf'(?:axios\.put|http\.put|this\.\$http\.put)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "PUT"),
         ("fetch_delete",   re.compile(rf'(?:axios\.delete|http\.delete|this\.\$http\.delete)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "DELETE"),
         ("fetch_patch",    re.compile(rf'(?:axios\.patch|http\.patch|this\.\$http\.patch)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "PATCH"),
-        # fetch com method dinâmico: fetch('/path', { method: 'POST' })
         ("fetch_method",   re.compile(rf'fetch\s*\(\s*{Q}({NQ}{{3,}}){Q}\s*,\s*\{{[^}}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
-        # fetch com template literal: fetch(`/api/${id}`)
+        # FIX: fetch_template agora só captura literais sem ${...} — template
+        # literals com variáveis (${ }) são descartados no filtro posterior.
         ("fetch_template", re.compile(r'(?:fetch|axios\.(?:get|post|put|patch|delete))\s*\(\s*\x60([^\x60]{3,})\x60', I), "ANY"),
-        # ── XMLHttpRequest ───────────────────────────────────────────────────
         ("xhr_open",       re.compile(rf'\.open\s*\(\s*[\x22\x27](\w+)[\x22\x27]\s*,\s*{Q}({NQ}{{3,}}){Q}', I), "XHR"),
-        # ── API versioned / GraphQL ───────────────────────────────────────────
         ("api_versioned",  re.compile(rf'{Q}(/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s\x22\x27\x60]*)?){Q}'), "ANY"),
         ("graphql",        re.compile(rf'{Q}((?:/graphql|/gql)(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "POST"),
         ("versioned_path", re.compile(rf'{Q}(/v\d+/[a-zA-Z0-9/_\-]{{3,}}(?:\?[^\s\x22\x27\x60]*)?){Q}'), "ANY"),
-        # ── router / href ────────────────────────────────────────────────────
         ("router_path",    re.compile(rf'(?:path|route|to|url)\s*:\s*{Q}(/[a-zA-Z0-9/_\-:]{{3,}}(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "GET"),
         ("href_action",    re.compile(rf'(?:href|action)\s*[=:]\s*{Q}(/[a-zA-Z0-9/_\-\.]{{3,}}(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "GET"),
-        # ── urls com query string completa ────────────────────────────────────
         ("url_with_query", re.compile(rf'{Q}((?:https?://[^\s\x22\x27\x60]+)?/[a-zA-Z0-9/_\-]{{2,}}\?(?:[a-zA-Z0-9_%\-]+=\w+&?)+){Q}', I), "GET"),
-        # ── form data / json body ─────────────────────────────────────────────
         ("formdata_post",  re.compile(rf'(?:new\s+FormData|FormData\s*\().*?(?:fetch|axios\.post|http\.post)\s*\(\s*{Q}({NQ}{{3,}}){Q}', ID), "POST"),
         ("json_body_post", re.compile(rf'JSON\.stringify\s*\([^)]*\).*?{Q}(/[a-zA-Z0-9/_\-]{{2,}}){Q}', ID), "POST"),
-        # ── WebSocket ────────────────────────────────────────────────────────
         ("websocket",      re.compile(rf'new\s+WebSocket\s*\(\s*{Q}(wss?://[^\s\x22\x27\x60]+){Q}', I), "WS"),
-        # ── internal subdomains ───────────────────────────────────────────────
-        ("internal_url",   re.compile(r'(https?://(?:internal|admin|dev|staging|api|backend|service)[^\s\x22\x27\x60]{3,})', I), "ANY"),
-        # ── environment / config ──────────────────────────────────────────────
+        # FIX: internal_url agora só captura URLs do target — antes capturava
+        # domínios externos contendo palavras como "internal" no nome.
+        # A validação por _is_valid_endpoint() faz o filtro correto.
+        ("internal_url",   re.compile(r'(https?://[^\s\x22\x27\x60]{3,})', I), "ANY"),
         ("env_url",        re.compile(rf'(?:apiUrl|baseUrl|endpointUrl|serviceUrl|backendUrl|API_URL|BASE_URL)\s*[:=]\s*{Q}({NQ}{{5,}}){Q}', I), "ANY"),
-        # ── strings de path genéricas (último recurso) ────────────────────────
         ("generic_path",   re.compile(rf'{Q}(/(?:api|v\d|auth|user|admin|account|login|logout|register|profile|settings|upload|download|search|order|payment|checkout|cart|product|item|list|detail|create|update|delete|reset|verify|confirm|token|refresh|oauth|callback)[a-zA-Z0-9/_\-]*){Q}', I), "ANY"),
     ]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX: is_valid_endpoint — filtra false positives antes de salvar
+# Portado do jsrecon_oob para garantir consistência entre as ferramentas.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STATIC_EXT = re.compile(
+    r'\.(png|jpg|jpeg|gif|ico|svg|webp|woff|woff2|ttf|eot|css|map|txt|pdf|zip|gz)$',
+    re.I
+)
+
+def is_valid_endpoint(path: str, root_domain: str,
+                      confirmed_hosts: set[str]) -> tuple[bool, str]:
+    """
+    Valida se o endpoint pertence ao target e é um endpoint real.
+    Retorna (válido, motivo_de_rejeição).
+    """
+    if not path or len(path) < 3:
+        return False, "too_short"
+
+    # FIX: descarta template literals JS — fetch(`/api/${id}`) é inválido como endpoint
+    if _TMPL_LITERAL.search(path):
+        return False, "js_template_literal"
+
+    # Extensões estáticas
+    clean_path = path.split("?")[0]
+    if _STATIC_EXT.search(clean_path):
+        return False, "static_asset"
+
+    # Paths que são claramente variáveis JS
+    if re.match(r'^\$\{|^\${|^#|^\.|^//|^/\*', path):
+        return False, "js_variable"
+
+    # Para URLs absolutas: verifica se é do target
+    if path.startswith(("http://", "https://", "ws://", "wss://")):
+        try:
+            host = urlparse(path).netloc.lower().split(":")[0]
+        except Exception:
+            return False, "parse_error"
+
+        root = root_domain.lower().lstrip("*.")
+        if host == root:
+            return True, "ok"
+        if host.endswith(f".{root}"):
+            return True, "ok"
+        if host in confirmed_hosts:
+            return True, "ok"
+        return False, f"external:{host}"
+
+    # Path relativo com /
+    if path.startswith("/"):
+        return True, "ok"
+
+    return False, "no_domain_no_slash"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Extração de body params de um endpoint POST/PUT/PATCH
+# Extração de body params
 # ─────────────────────────────────────────────────────────────────────────────
 
 _BODY_PARAMS_RE = re.compile(
@@ -263,7 +388,6 @@ _KEY_RE = re.compile(r'["\']([a-zA-Z_][a-zA-Z0-9_]{1,40})["\']')
 
 
 def _extract_body_params(content: str, pos: int) -> list[str]:
-    """Tenta extrair chaves do body mais próximo do match."""
     window = content[max(0, pos - 200): pos + 600]
     params = []
     for bm in _BODY_PARAMS_RE.finditer(window):
@@ -271,8 +395,7 @@ def _extract_body_params(content: str, pos: int) -> list[str]:
             k = km.group(1)
             if k not in ("null", "true", "false", "undefined"):
                 params.append(k)
-    return list(dict.fromkeys(params))  # dedup mantendo ordem
-
+    return list(dict.fromkeys(params))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Estado global thread-safe
@@ -283,7 +406,6 @@ _analyzed_lock:   threading.Lock  = threading.Lock()
 _seen_endpoints:  set[tuple]      = set()
 _endpoint_lock:   threading.Lock  = threading.Lock()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Rate limiting + retries (HTTP)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -291,6 +413,23 @@ _endpoint_lock:   threading.Lock  = threading.Lock()
 _host_sems: dict[str, threading.Semaphore] = {}
 _host_lock  = threading.Lock()
 _req_logger = logging.getLogger("jsrecon2.req")
+
+# FIX: GlobalRateLimiter para validação — evita flood no alvo
+class GlobalRateLimiter:
+    def __init__(self, delay: float):
+        self.delay = delay
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.time()
+            gap = now - self._last
+            if gap < self.delay:
+                time.sleep(self.delay - gap)
+            self._last = time.time()
+
+_val_limiter = GlobalRateLimiter(0.3)  # sobrescrito em make_cfg()
 
 
 def _sem(url: str) -> threading.Semaphore:
@@ -328,16 +467,11 @@ def _make_get(cfg: dict):
             return r
     return _get
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Inferir base URL a partir do JS source
+# Resolução de URL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _base_from_js_url(js_url: str, root_domain: str) -> str:
-    """
-    Se o JS veio de api.target.com, o endpoint base é https://api.target.com
-    Nunca atribui ao domínio raiz se o JS pertence a subdomínio.
-    """
     parsed = urlparse(js_url)
     if parsed.scheme and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}"
@@ -345,21 +479,42 @@ def _base_from_js_url(js_url: str, root_domain: str) -> str:
 
 
 def _resolve_path(path: str, js_url: str, root_domain: str) -> str:
-    """Constrói URL absoluta respeitando a origem do JS."""
+    """
+    FIX: usa urljoin para paths relativos, respeitando ../ e caminhos sem /.
+    Antes: path relativo sem / ignorava o path base do arquivo JS.
+    Agora: urljoin(js_url, path) resolve corretamente contra a URL do JS.
+    """
     if path.startswith(("http://", "https://", "ws://", "wss://")):
         return path
-    base = _base_from_js_url(js_url, root_domain)
-    return base + (path if path.startswith("/") else "/" + path)
-
+    if path.startswith("/"):
+        # Path absoluto — usa só scheme+host do JS
+        parsed = urlparse(js_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}{path}"
+        return f"https://{root_domain}{path}"
+    # Path relativo — resolve contra a URL do JS (respeita ../)
+    return urljoin(js_url, path)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistência de endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _normalize_method_key(method: str) -> str:
+    """
+    FIX: normaliza método para a chave de dedup.
+    ANY/DYNAMIC/XHR/WS → '*' para evitar que o mesmo endpoint
+    extraído por dois padrões diferentes (ex: fetch_get + generic_path)
+    passe pela dedup como keys distintos ('GET', url) e ('*', url).
+    """
+    if method in ("ANY", "DYNAMIC", "XHR"):
+        return "*"
+    return method.upper()
+
+
 def _save_endpoint(ep: dict, cfg: dict) -> bool:
-    method   = ep.get("method", "UNKNOWN").upper()
+    method   = _normalize_method_key(ep.get("method", "UNKNOWN"))
     abs_url  = ep.get("absolute_url", "").split("?")[0].rstrip("/") or "/"
-    key      = (method if method != "ANY" else "*", abs_url)
+    key      = (method, abs_url)
 
     with _endpoint_lock:
         if key in _seen_endpoints:
@@ -369,7 +524,6 @@ def _save_endpoint(ep: dict, cfg: dict) -> bool:
     _append(cfg["endpoints_jsonl"], json.dumps(ep, ensure_ascii=False))
     return True
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Análise de JS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -377,16 +531,17 @@ def _save_endpoint(ep: dict, cfg: dict) -> bool:
 def analyze_js(content: str, js_url: str, cfg: dict, logger: logging.Logger) -> int:
     found = 0
 
-    # Beautify para melhorar extração em JS minificado
     if _BEAUTIFY:
         try:
             content = jsbeautifier.beautify(content)
         except Exception:
             pass
 
+    root_domain    = cfg["domain"]
+    confirmed_hosts = cfg.get("confirmed_hosts", set())
+
     for label, pattern, method_hint in cfg["endpoint_patterns"]:
         for m in pattern.finditer(content):
-            # Extrai path e método
             if label == "xhr_open":
                 method = m.group(1).upper()
                 path   = m.group(2).strip().strip("\"'`")
@@ -397,36 +552,35 @@ def analyze_js(content: str, js_url: str, cfg: dict, logger: logging.Logger) -> 
                 path   = m.group(1).strip().strip("\"'`")
                 method = method_hint
 
-            # Filtros básicos
             if not path or len(path) < 2:
                 continue
-            if re.search(r'\.(png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|css|map|txt|pdf)$', path, re.I):
-                continue
-            # Ignora paths que são apenas variáveis JS
-            if re.match(r'^\$\{|^\${|^#|^\.|^//|^/\*', path):
+
+            # FIX: validação centralizada que inclui filtro de template literals,
+            # extensões estáticas e verificação de domínio.
+            valid, reason = is_valid_endpoint(path, root_domain, confirmed_hosts)
+            if not valid:
+                logger.debug("[DROP][%s] %s ← %s", reason, path[:80], js_url)
                 continue
 
-            abs_url = _resolve_path(path, js_url, cfg["domain"])
+            abs_url = _resolve_path(path, js_url, root_domain)
 
-            # Extrai query params
             qs = ""
             if "?" in path:
                 qs = path.split("?", 1)[1].split("#")[0]
 
-            # Extrai body params para métodos com corpo
             body_params: list[str] = []
             if method in ("POST", "PUT", "PATCH", "DYNAMIC", "ANY"):
                 body_params = _extract_body_params(content, m.start())
 
             ep = {
-                "method":      method,
-                "path":        path,
+                "method":       method,
+                "path":         path,
                 "absolute_url": abs_url,
                 "query_params": qs,
-                "body_params": body_params,
-                "js_source":   js_url,
-                "origin_host": urlparse(js_url).netloc or cfg["domain"],
-                "label":       label,
+                "body_params":  body_params,
+                "js_source":    js_url,
+                "origin_host":  urlparse(js_url).netloc or root_domain,
+                "label":        label,
             }
 
             if _save_endpoint(ep, cfg):
@@ -456,7 +610,6 @@ def process_js_url(url: str, cfg: dict, logger: logging.Logger, get_fn) -> int:
             return 0
         _analyzed_js.add(key)
 
-    # Cache em disco
     cache_file = cfg["cache_dir"] / (hashlib.sha1(key.encode()).hexdigest()[:16] + ".json")
     if cache_file.exists() and not cfg.get("no_cache"):
         try:
@@ -506,11 +659,13 @@ def analyze_js_list(js_urls: list[str], cfg: dict, logger: logging.Logger) -> in
             if done % 20 == 0:
                 logger.info("  Progresso: %d/%d JS analisados", done, len(js_urls))
             try:
-                total += fut.result()
+                # FIX: timeout por future — evita thread presa em JS que nunca responde
+                total += fut.result(timeout=30)
+            except TimeoutError:
+                logger.warning("  Worker JS timeout (30s)")
             except Exception as e:
                 logger.error("Worker error: %s", e)
     return total
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Playwright — browser real
@@ -579,9 +734,8 @@ async def live_crawl_all(
             logger.error("  [browser] erro em %s: %s", url, e)
     return all_js
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Coleta de JS via ferramentas (gau / waybackurls / gospider / katana)
+# Coleta de JS via ferramentas
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_js_tools(
@@ -589,38 +743,54 @@ def collect_js_tools(
     alive_urls: list[str],
     cfg: dict,
     logger: logging.Logger,
+    single_target: bool = False,
 ) -> set[str]:
+    """
+    FIX: modo single_target — gau e waybackurls sem --subs, gospider/katana
+    só nas URLs do domínio exato. Evita coletar JS de subdomínios fora do escopo
+    quando o alvo foi especificado como URL exata.
+    """
     js_urls: set[str] = set()
-    logger.info("═══ Coleta de JS via ferramentas ═══")
+    logger.info("═══ Coleta de JS via ferramentas (%s) ═══",
+                "single-target" if single_target else "full")
 
     # gau
     if tool_ok("gau"):
         logger.info("[gau] coletando URLs históricas…")
-        lines = run_cmd(["gau", "--subs", domain], logger, timeout=300)
+        gau_args = ["gau", domain]
+        if not single_target:
+            gau_args = ["gau", "--subs", domain]
+        lines = run_cmd(gau_args, logger, timeout=300)
+        before = len(js_urls)
         for l in lines:
             if ".js" in urlparse(l).path.lower() and not _CDN_RE.search(l):
                 js_urls.add(l.strip())
-        logger.info("[gau] %d JS encontrados", len(js_urls))
+        logger.info("[gau] +%d JS", len(js_urls) - before)
     else:
         logger.warning("gau não encontrado  |  go install github.com/lc/gau/v2/cmd/gau@latest")
 
     # waybackurls
-    prev = len(js_urls)
     if tool_ok("waybackurls"):
         logger.info("[waybackurls] coletando…")
         lines = run_cmd(["waybackurls", domain], logger, timeout=300)
+        before = len(js_urls)
         for l in lines:
             if ".js" in urlparse(l).path.lower() and not _CDN_RE.search(l):
                 js_urls.add(l.strip())
-        logger.info("[waybackurls] +%d JS", len(js_urls) - prev)
+        logger.info("[waybackurls] +%d JS", len(js_urls) - before)
     else:
         logger.warning("waybackurls não encontrado  |  go install github.com/tomnomnom/waybackurls@latest")
 
     # gospider
-    prev = len(js_urls)
     if tool_ok("gospider"):
         logger.info("[gospider] crawling…")
-        for url in alive_urls[:30]:  # limita para não demorar muito
+        # single_target: só URLs do host exato
+        target_urls = alive_urls
+        if single_target:
+            target_urls = [u for u in alive_urls
+                           if urlparse(u).netloc.lower().split(":")[0] == domain.lower()]
+        before = len(js_urls)
+        for url in target_urls[:30]:
             lines = run_cmd(
                 ["gospider", "-s", url, "-d", "2", "-t", "5", "--js", "--quiet"],
                 logger, timeout=120,
@@ -629,14 +799,14 @@ def collect_js_tools(
                 m = re.search(r'https?://[^\s"\'<>]+\.js\b[^\s"\'<>]*', l)
                 if m and not _CDN_RE.search(m.group(0)):
                     js_urls.add(m.group(0))
-        logger.info("[gospider] +%d JS", len(js_urls) - prev)
+        logger.info("[gospider] +%d JS", len(js_urls) - before)
     else:
         logger.warning("gospider não encontrado  |  go install github.com/jaeles-project/gospider@latest")
 
     # katana
-    prev = len(js_urls)
     if tool_ok("katana"):
         logger.info("[katana] crawling…")
+        before = len(js_urls)
         for url in alive_urls[:30]:
             lines = run_cmd(
                 ["katana", "-u", url, "-d", "3", "-jc", "-silent"],
@@ -645,13 +815,12 @@ def collect_js_tools(
             for l in lines:
                 if ".js" in urlparse(l).path.lower() and not _CDN_RE.search(l):
                     js_urls.add(l.strip())
-        logger.info("[katana] +%d JS", len(js_urls) - prev)
+        logger.info("[katana] +%d JS", len(js_urls) - before)
     else:
         logger.warning("katana não encontrado  |  go install github.com/projectdiscovery/katana/cmd/katana@latest")
 
     logger.info("Total JS via ferramentas (pré-filtro): %d", len(js_urls))
     return js_urls
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Etapa 1 — Enumeração de subdomínios
@@ -707,7 +876,6 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
     _write(cfg["subs_file"], sorted(clean), logger)
     return clean
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Etapa 2 — Nmap
 # ─────────────────────────────────────────────────────────────────────────────
@@ -747,7 +915,6 @@ def nmap_scan(subs: set[str], cfg: dict, logger: logging.Logger) -> dict[str, li
 
     logger.info("[nmap] portas abertas: %d", sum(len(v) for v in open_ports.values()))
     return open_ports
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Etapa 3 — httpx
@@ -797,11 +964,9 @@ def httpx_probe(
         logger.error("Erro no httpx: %s", e)
         urls_clean = sorted(candidates)
 
-    # Salva IPs únicos
     ips: set[str] = set()
     for u in urls_clean:
         host = urlparse(u).netloc.split(":")[0]
-        # Tenta resolver só se for domínio (não IP)
         if not re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
             try:
                 import socket
@@ -822,7 +987,6 @@ def httpx_probe(
     logger.info("[httpx] hosts ativos: %d | IPs únicos: %d", len(urls_clean), len(ips))
     return sorted(set(urls_clean)), confirmed_hosts
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Etapa 4 — Coleta de JS (ferramentas + browser)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -832,43 +996,46 @@ def collect_all_js(
     confirmed_hosts: set[str],
     cfg: dict,
     logger: logging.Logger,
+    single_target: bool = False,
 ) -> set[str]:
     logger.info("═══ Coleta de JS ═══")
     all_js: set[str] = set()
 
-    # Via ferramentas (gau, waybackurls, gospider, katana)
-    tool_js = collect_js_tools(cfg["domain"], alive_urls, cfg, logger)
+    tool_js = collect_js_tools(cfg["domain"], alive_urls, cfg, logger,
+                               single_target=single_target)
     all_js.update(tool_js)
 
-    # Via browser (Playwright)
     if not cfg.get("no_live"):
-        seen_targets: set[str] = set()
-        targets: list[str] = []
-        for url in alive_urls:
-            parsed = urlparse(url)
-            key    = parsed.netloc
-            if key not in seen_targets:
-                seen_targets.add(key)
-                targets.append(f"{parsed.scheme}://{parsed.netloc}")
+        if not HAS_PLAYWRIGHT:
+            logger.warning("[browser] Playwright não instalado — pulando coleta via browser.")
+            logger.warning("          pip install playwright && playwright install chromium")
+        else:
+            seen_targets: set[str] = set()
+            targets: list[str] = []
+            for url in alive_urls:
+                parsed = urlparse(url)
+                # FIX: single_target — só abre o host exato, ignora subdomínios
+                if single_target and parsed.netloc.lower().split(":")[0] != cfg["domain"].lower():
+                    continue
+                key = parsed.netloc
+                if key not in seen_targets:
+                    seen_targets.add(key)
+                    targets.append(f"{parsed.scheme}://{parsed.netloc}")
 
-        logger.info("[browser] %d alvos únicos", len(targets))
-        browser_js = asyncio.run(live_crawl_all(targets, cfg, logger))
-        all_js.update(browser_js)
-        logger.info("[browser] %d JS coletados", len(browser_js))
+            logger.info("[browser] %d alvos únicos", len(targets))
+            browser_js = asyncio.run(live_crawl_all(targets, cfg, logger))
+            all_js.update(browser_js)
+            logger.info("[browser] %d JS coletados", len(browser_js))
 
-    # Remove .map
     all_js = {u for u in all_js if not u.endswith(".js.map")}
-
-    # Filtro: apenas JS do alvo
     js_clean = filter_target_js(all_js, cfg["domain"], confirmed_hosts, logger)
 
     _write(cfg["js_urls_file"], sorted(js_clean), logger)
     logger.info("JS do target (final): %d", len(js_clean))
     return js_clean
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Validação de endpoints via curl / requests
+# Validação de endpoints via requests
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DESTRUCTIVE_METHODS = {"DELETE"}
@@ -880,10 +1047,26 @@ _SKIP_VALIDATE_PATHS = re.compile(
 _VALIDATION_LOCK = threading.Lock()
 _VALIDATED_URLS:  set[str] = set()
 
+# FIX: mapa de normalização de método para requests — ANY/DYNAMIC nunca
+# devem chegar como requests.any() (não existe) — antes causava fallback
+# para GET silencioso, perdendo endpoints POST.
+_METHOD_NORMALIZE = {
+    "ANY":     "get",
+    "DYNAMIC": "post",
+    "XHR":     "get",
+    "WS":      None,    # WebSocket — não valida via HTTP
+    "GET":     "get",
+    "POST":    "post",
+    "PUT":     "put",
+    "PATCH":   "patch",
+    "DELETE":  "delete",
+    "UNKNOWN": "get",
+}
+
 
 def _build_curl(ep: dict) -> str:
-    method = ep["method"]
-    url    = ep["absolute_url"]
+    method = ep.get("method", "GET")
+    url    = ep.get("absolute_url", "")
     parts  = [f"curl -sk -o /dev/null -w '%{{http_code}} %{{size_download}} %{{time_total}}'"]
     parts.append(f"-X {method}")
     parts.append("-H 'User-Agent: Mozilla/5.0 (compatible; jsrecon2/1.0)'")
@@ -902,28 +1085,30 @@ def _build_curl(ep: dict) -> str:
 
 
 def validate_endpoint(ep: dict, cfg: dict, logger: logging.Logger) -> dict | None:
-    method = ep.get("method", "UNKNOWN").upper()
-    url    = ep.get("absolute_url", "")
+    method     = ep.get("method", "UNKNOWN").upper()
+    url        = ep.get("absolute_url", "")
 
-    # Nunca executa DELETE
     if method in _DESTRUCTIVE_METHODS:
         return {**ep, "status": "SKIPPED", "reason": "DELETE não executado", "curl": _build_curl(ep)}
 
-    # Pula paths destrutivos mesmo em outros métodos
     if _SKIP_VALIDATE_PATHS.search(url):
         return {**ep, "status": "SKIPPED", "reason": "path destrutivo", "curl": _build_curl(ep)}
 
-    # Dedup por URL
+    # FIX: WS — não valida via HTTP
+    req_method_str = _METHOD_NORMALIZE.get(method, "get")
+    if req_method_str is None:
+        return {**ep, "status": "SKIPPED", "reason": "WebSocket — não validado via HTTP", "curl": ""}
+
     key = url.split("?")[0]
     with _VALIDATION_LOCK:
         if key in _VALIDATED_URLS:
             return None
         _VALIDATED_URLS.add(key)
 
-    curl_cmd = _build_curl(ep)
+    curl_cmd   = _build_curl(ep)
+    req_method = getattr(requests, req_method_str)
 
     try:
-        req_method = getattr(requests, method.lower(), requests.get)
         kwargs: dict = {
             "headers": {
                 "User-Agent": "Mozilla/5.0 (compatible; jsrecon2/1.0)",
@@ -934,9 +1119,12 @@ def validate_endpoint(ep: dict, cfg: dict, logger: logging.Logger) -> dict | Non
             "allow_redirects": True,
         }
 
-        if method in ("POST", "PUT", "PATCH") and ep.get("body_params"):
+        if req_method_str in ("post", "put", "patch") and ep.get("body_params"):
             body = {k: f"<{k}>" for k in ep["body_params"]}
             kwargs["json"] = body
+
+        # FIX: rate limit antes de cada request de validação
+        _val_limiter.acquire()
 
         t0   = time.monotonic()
         resp = req_method(url, **kwargs)
@@ -985,13 +1173,15 @@ def validate_all_endpoints(cfg: dict, logger: logging.Logger) -> list[dict]:
         futs = {ex.submit(validate_endpoint, ep, cfg, logger): ep for ep in endpoints}
         for fut in as_completed(futs):
             try:
-                r = fut.result()
+                # FIX: timeout por future
+                r = fut.result(timeout=30)
                 if r:
                     results.append(r)
+            except TimeoutError:
+                logger.warning("  Validation future timeout (30s)")
             except Exception as e:
                 logger.error("Validation worker error: %s", e)
 
-    # Salva resultados
     val_jsonl = cfg["out_dir"] / "validation.jsonl"
     val_txt   = cfg["out_dir"] / "validation.txt"
 
@@ -1002,8 +1192,7 @@ def validate_all_endpoints(cfg: dict, logger: logging.Logger) -> list[dict]:
         status_groups[st].append(r)
 
     lines_txt = []
-    for status_code, items in sorted(status_groups.items(),
-                                     key=lambda x: str(x[0])):
+    for status_code, items in sorted(status_groups.items(), key=lambda x: str(x[0])):
         lines_txt.append(f"\n{'═'*60}")
         lines_txt.append(f"  STATUS: {status_code}  ({len(items)} endpoints)")
         lines_txt.append(f"{'═'*60}")
@@ -1030,9 +1219,11 @@ def validate_all_endpoints(cfg: dict, logger: logging.Logger) -> list[dict]:
 
     return results
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HTML Report
+# FIX: fontes do Google removidas — falha em rede air-gapped / offline.
+# Usa font-family system stack.
+# FIX: mensagem quando não há endpoints.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_html_report(
@@ -1064,13 +1255,13 @@ def write_html_report(
         "UNKNOWN": "#64748b", "SKIPPED": "#334155",
     }
 
-    status_color = lambda s: (
-        "#22c55e" if str(s).startswith("2") else
-        "#f97316" if str(s).startswith("3") else
-        "#ef4444" if str(s) in ("401", "403") else
-        "#94a3b8" if str(s).startswith("4") else
-        "#64748b"
-    )
+    def status_color(s):
+        s = str(s)
+        if s.startswith("2"):   return "#22c55e"
+        if s.startswith("3"):   return "#f97316"
+        if s in ("401","403"):  return "#ef4444"
+        if s.startswith("4"):   return "#94a3b8"
+        return "#64748b"
 
     method_opts = "".join(
         f'<option value="{m}">{m}</option>'
@@ -1082,41 +1273,45 @@ def write_html_report(
     )
     status_opts = "".join(
         f'<option value="{s}">{s}</option>'
-        for s in sorted(set(str(r.get("status", "?")) for r in validation_results if r.get("status") != "SKIPPED"))
+        for s in sorted(set(str(r.get("status", "?")) for r in validation_results
+                            if r.get("status") != "SKIPPED"))
     )
 
-    rows = ""
-    for ep in endpoints:
-        method  = ep.get("method", "?")
-        mc      = meth_colors.get(method, "#64748b")
-        abs_url = ep.get("absolute_url", "")
-        key     = abs_url.split("?")[0]
-        vr      = val_map.get(key, {})
-        status  = vr.get("status", "—")
-        sc      = status_color(status)
-        path    = _esc(ep.get("path", "")[:100])
-        host    = _esc(ep.get("origin_host", ""))
-        curl    = _esc(vr.get("curl", ""))
-        body_p  = ", ".join(ep.get("body_params", []))
-        qp      = _esc(ep.get("query_params", "")[:80])
-        time_s  = vr.get("time_s", "")
-        size    = vr.get("size", "")
-        label   = ep.get("label", "")
+    if endpoints:
+        rows = ""
+        for ep in endpoints:
+            method  = ep.get("method", "?")
+            mc      = meth_colors.get(method, "#64748b")
+            abs_url = ep.get("absolute_url", "")
+            key     = abs_url.split("?")[0]
+            vr      = val_map.get(key, {})
+            status  = vr.get("status", "—")
+            sc      = status_color(status)
+            path    = _esc(ep.get("path", "")[:100])
+            host    = _esc(ep.get("origin_host", ""))
+            curl    = _esc(vr.get("curl", ""))
+            body_p  = ", ".join(ep.get("body_params", []))
+            qp      = _esc(ep.get("query_params", "")[:80])
+            time_s  = vr.get("time_s", "")
+            size    = vr.get("size", "")
 
-        rows += (
-            f'<tr data-method="{method}" data-host="{ep.get("origin_host","")}" data-status="{status}">'
-            f'<td><span class="badge" style="background:{mc}">{method}</span></td>'
-            f'<td class="url-cell mono">{path}</td>'
-            f'<td class="url-cell"><a href="{abs_url}" target="_blank">{_esc(abs_url[:90])}</a></td>'
-            f'<td class="dim">{host}</td>'
-            f'<td><span class="badge" style="background:{sc};font-size:11px">{status}</span></td>'
-            f'<td class="dim center">{time_s}{"s" if time_s else ""}</td>'
-            f'<td class="dim center">{size}</td>'
-            f'<td class="dim">{body_p[:60]}</td>'
-            f'<td class="dim">{qp}</td>'
-            f'<td class="curl-cell"><code>{curl[:200]}</code></td>'
-            f'</tr>\n'
-        )
+            rows += (
+                f'<tr data-method="{method}" data-host="{ep.get("origin_host","")}" data-status="{status}">'
+                f'<td><span class="badge" style="background:{mc}">{method}</span></td>'
+                f'<td class="url-cell mono">{path}</td>'
+                f'<td class="url-cell"><a href="{abs_url}" target="_blank">{_esc(abs_url[:90])}</a></td>'
+                f'<td class="dim">{host}</td>'
+                f'<td><span class="badge" style="background:{sc};font-size:11px">{status}</span></td>'
+                f'<td class="dim center">{time_s}{"s" if time_s else ""}</td>'
+                f'<td class="dim center">{size}</td>'
+                f'<td class="dim">{body_p[:60]}</td>'
+                f'<td class="dim">{qp}</td>'
+                f'<td class="curl-cell"><code>{curl[:200]}</code></td>'
+                f'</tr>\n'
+            )
+    else:
+        # FIX: mensagem quando não há endpoints em vez de tabela vazia
+        rows = '<tr><td colspan="10" style="text-align:center;padding:2rem;color:#64748b">Nenhum endpoint encontrado nesta sessão.</td></tr>'
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -1134,12 +1329,13 @@ def write_html_report(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>jsrecon2 — {cfg['domain']}</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+/* FIX: font-family system stack — sem dependência de Google Fonts (falha offline) */
 *{{box-sizing:border-box;margin:0;padding:0}}
 :root{{
   --bg:#0a0c12;--surface:#0f1117;--surface2:#161922;--border:#1e2535;
   --text:#e2e8f0;--dim:#64748b;--accent:#38bdf8;
-  --font:'IBM Plex Sans',sans-serif;--mono:'IBM Plex Mono',monospace;
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  --mono:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;
 }}
 body{{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5}}
 a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}
@@ -1242,20 +1438,17 @@ function sort(col){{
     cfg["summary_html"].write_text(html, encoding="utf-8")
     logger.info("HTML → %s", cfg["summary_html"])
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TXT Summary
+# TXT Summary e Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_summary_txt(cfg: dict, logger: logging.Logger, stats: dict, val_results: list[dict]) -> None:
     status_summary = collections.Counter(str(r.get("status", "?")) for r in val_results)
-
     ep_count = sum(
         1 for l in (cfg["endpoints_jsonl"].read_text(encoding="utf-8", errors="ignore").splitlines()
                     if cfg["endpoints_jsonl"].exists() else [])
         if l.strip()
     )
-
     lines = [
         "=" * 64,
         "  JSRECON2 — SUMÁRIO",
@@ -1298,10 +1491,6 @@ def write_summary_txt(cfg: dict, logger: logging.Logger, stats: dict, val_result
         logger.info(l)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Endpoints TXT
-# ─────────────────────────────────────────────────────────────────────────────
-
 def write_endpoints_txt(cfg: dict, logger: logging.Logger) -> None:
     if not cfg["endpoints_jsonl"].exists():
         return
@@ -1323,14 +1512,25 @@ def write_endpoints_txt(cfg: dict, logger: logging.Logger) -> None:
             pass
     _write(cfg["endpoints_txt"], lines, logger)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_cfg(domain: str, args: argparse.Namespace) -> dict:
-    out = Path(f"jsrecon2_{domain}")
+def make_cfg(domain: str, args: argparse.Namespace,
+             out_suffix: str = "") -> dict:
+    """
+    out_suffix permite diferenciar pastas quando múltiplos alvos são
+    processados em sequência (ex: jsrecon2_host1/, jsrecon2_host2/).
+    """
+    safe_name = re.sub(r'[^\w.\-]', '_', out_suffix or domain)
+    out = Path(f"jsrecon2_{safe_name}")
     out.mkdir(exist_ok=True)
+
+    delay = getattr(args, "delay", 0.3)
+
+    global _val_limiter
+    _val_limiter = GlobalRateLimiter(delay)
+
     return {
         "domain":            domain,
         "out_dir":           out,
@@ -1344,6 +1544,7 @@ def make_cfg(domain: str, args: argparse.Namespace) -> dict:
         "log_file":          out / "jsrecon2.log",
         "cache_dir":         out / ".js_cache",
         "endpoint_patterns": _endpoint_patterns(),
+        "confirmed_hosts":   set(),   # preenchido após httpx
         "timeout":           args.timeout,
         "workers":           args.workers,
         "live_timeout":      args.live_timeout,
@@ -1353,7 +1554,6 @@ def make_cfg(domain: str, args: argparse.Namespace) -> dict:
         "no_live":           args.no_live,
         "no_validate":       args.no_validate,
     }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Preflight
@@ -1380,13 +1580,17 @@ def preflight(logger: logging.Logger) -> None:
     logger.info("OK      : %s", ", ".join(t for t, _ in ok) or "nenhuma")
     for t, cmd in missing:
         logger.warning("AUSENTE : %-22s  →  %s", t, cmd)
-    logger.info("───────────────────────────────────────────────────────────────")
+
+    if HAS_PLAYWRIGHT:
+        logger.info("Playwright  : disponível")
+    else:
+        logger.warning("Playwright  : ausente  →  pip install playwright && playwright install chromium")
 
     if _BEAUTIFY:
-        logger.info("js-beautify : disponível (melhora extração em JS minificado)")
+        logger.info("js-beautify : disponível")
     else:
         logger.warning("js-beautify : ausente  →  pip install jsbeautifier")
-
+    logger.info("───────────────────────────────────────────────────────────────")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -1402,90 +1606,135 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
+  # Domínio normal — fluxo completo
   python3 jsrecon2.py target.com.br
+
+  # URL específica com porta — pula subfinder/nmap automaticamente
+  python3 jsrecon2.py https://api.target.com:8443
+  python3 jsrecon2.py https://broadcast.sysmo.com.br:5001
+
+  # Arquivo com múltiplos alvos (um por linha, # = comentário)
+  python3 jsrecon2.py targets.txt
+
+  # Opções comuns
   python3 jsrecon2.py target.com.br --no-nmap --workers 30
   python3 jsrecon2.py target.com.br --no-subs --no-live
-  python3 jsrecon2.py target.com.br --no-validate       # não faz requests de validação
-  python3 jsrecon2.py target.com.br --no-headless       # browser visível (debug)
+  python3 jsrecon2.py target.com.br --no-validate
+  python3 jsrecon2.py target.com.br --skip-recon     # reutiliza endpoints.jsonl
+  python3 jsrecon2.py target.com.br --no-headless    # browser visível (debug)
+  python3 jsrecon2.py target.com.br --delay 0.5      # rate limit na validação
 
 Variáveis de ambiente opcionais:
   CHAOS_KEY      chave para chaos (ProjectDiscovery)
   GITHUB_TOKEN   token para github-subdomains
         """,
     )
-    p.add_argument("domain",          help="Domínio alvo (ex: target.com.br)")
+    p.add_argument("target",          help="Domínio, URL completa ou arquivo .txt com alvos")
     p.add_argument("--no-subs",       action="store_true", help="Pula enumeração de subdomínios")
     p.add_argument("--no-nmap",       action="store_true", help="Pula scan de portas")
     p.add_argument("--no-live",       action="store_true", help="Pula coleta via browser")
     p.add_argument("--no-validate",   action="store_true", help="Pula validação de endpoints")
     p.add_argument("--no-headless",   action="store_true", help="Abre browser visível (debug)")
     p.add_argument("--no-cache",      action="store_true", help="Ignora cache de JS em disco")
-    p.add_argument("--workers",       type=int, default=20, help="Workers paralelos (padrão: 20)")
-    p.add_argument("--timeout",       type=int, default=10, help="Timeout HTTP em segundos (padrão: 10)")
-    p.add_argument("--live-timeout",  type=int, default=30, help="Timeout do browser (padrão: 30)")
-    p.add_argument("--live-wait",     type=int, default=2,  help="Espera após networkidle (padrão: 2)")
+    p.add_argument("--skip-recon",    action="store_true",
+                   help="Pula recon e vai direto para validação (requer endpoints.jsonl existente)")
+    p.add_argument("--workers",       type=int,   default=20,  help="Workers paralelos (padrão: 20)")
+    p.add_argument("--timeout",       type=int,   default=10,  help="Timeout HTTP em segundos (padrão: 10)")
+    p.add_argument("--delay",         type=float, default=0.3, help="Delay entre validações em segundos (padrão: 0.3)")
+    p.add_argument("--live-timeout",  type=int,   default=30,  help="Timeout do browser (padrão: 30)")
+    p.add_argument("--live-wait",     type=int,   default=2,   help="Espera após networkidle (padrão: 2)")
     return p.parse_args()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Processamento de um alvo
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    args   = parse_args()
-    domain = args.domain.strip()
-    for _pfx in ("https://", "http://"):
-        if domain.startswith(_pfx):
-            domain = domain[len(_pfx):]
-    domain = domain.rstrip("/")
-
-    cfg    = make_cfg(domain, args)
-    logger = setup_logging(cfg["log_file"])
+def run_target(target: Target, args: argparse.Namespace,
+               logger: logging.Logger) -> None:
+    """
+    Executa o fluxo completo para um alvo.
+    Chamado para cada alvo quando --target é um arquivo .txt.
+    """
+    domain = target.host
+    cfg    = make_cfg(domain, args, out_suffix=target.safe_dirname())
     stats: dict[str, int] = {}
 
     logger.info("=" * 66)
-    logger.info("  jsrecon2  —  alvo: %s", domain)
-    logger.info("  Filtro  : %s  e  *.%s  (apenas JS do target)", domain, domain)
-    logger.info("  Saída   : %s", cfg["out_dir"])
+    logger.info("  jsrecon2  —  alvo: %s", target.label)
+    if target.is_single:
+        logger.info("  Modo     : single-target (subfinder/nmap pulados)")
+    logger.info("  Filtro   : %s  e  *.%s  (apenas JS do target)", domain, domain)
+    logger.info("  Saída    : %s", cfg["out_dir"])
     logger.info("=" * 66)
 
-    preflight(logger)
+    # ── --skip-recon: carrega endpoints.jsonl existente e vai direto para validação
+    if args.skip_recon:
+        if not cfg["endpoints_jsonl"].exists():
+            logger.error("--skip-recon: endpoints.jsonl não encontrado em %s", cfg["out_dir"])
+            logger.error("Execute sem --skip-recon primeiro para gerar os endpoints.")
+            return
+        ep_count = sum(1 for l in cfg["endpoints_jsonl"].read_text().splitlines() if l.strip())
+        logger.info("--skip-recon: %d endpoints carregados de sessão anterior.", ep_count)
+        # confirmed_hosts não disponível — usa set vazio (validação já tem URLs absolutas)
+        cfg["confirmed_hosts"] = set()
+        val_results: list[dict] = []
+        if not args.no_validate:
+            val_results = validate_all_endpoints(cfg, logger)
+        write_html_report(cfg, logger, {}, val_results)
+        write_summary_txt(cfg, logger, {}, val_results)
+        return
 
-    # ── 1. Subdomínios ────────────────────────────────────────────────────────
-    subs = {domain} if args.no_subs else enum_subdomains(domain, cfg, logger)
-    if args.no_subs:
-        logger.info("--no-subs: usando apenas domínio raiz.")
-    stats["subs"] = len(subs)
+    # ── 1. Single-target: gera alive_urls diretamente da URL fornecida
+    if target.is_single:
+        base = target.base_url
+        alive_urls     = [base] if base else [f"https://{domain}"]
+        confirmed_hosts: set[str] = {domain}
+        subs           = {domain}
+        stats["subs"]  = 1
+        stats["alive"] = len(alive_urls)
+        _write(cfg["subs_file"],  [domain], logger)
+        _write(cfg["alive_file"], alive_urls, logger)
+        logger.info("Single-target: usando %s diretamente.", base or domain)
 
-    # ── 2. Nmap ───────────────────────────────────────────────────────────────
-    open_ports = (
-        {s: [80, 443] for s in subs}
-        if args.no_nmap
-        else nmap_scan(subs, cfg, logger)
-    )
+    else:
+        # ── 1. Subdomínios ────────────────────────────────────────────────────
+        subs = {domain} if args.no_subs else enum_subdomains(domain, cfg, logger)
+        if args.no_subs:
+            logger.info("--no-subs: usando apenas domínio raiz.")
+        stats["subs"] = len(subs)
 
-    # ── 3. httpx ──────────────────────────────────────────────────────────────
-    alive_urls, confirmed_hosts = httpx_probe(open_ports, cfg, logger)
-    stats["alive"] = len(alive_urls)
+        # ── 2. Nmap ───────────────────────────────────────────────────────────
+        open_ports = (
+            {s: [80, 443] for s in subs}
+            if args.no_nmap
+            else nmap_scan(subs, cfg, logger)
+        )
 
-    if not alive_urls:
-        logger.warning("Nenhum host ativo. Encerrando.")
-        sys.exit(0)
+        # ── 3. httpx ──────────────────────────────────────────────────────────
+        alive_urls, confirmed_hosts = httpx_probe(open_ports, cfg, logger)
+        stats["alive"] = len(alive_urls)
 
-    # ── 4. Coleta de JS ────────────────────────────────────────────────────────
-    js_urls = collect_all_js(alive_urls, confirmed_hosts, cfg, logger)
+        if not alive_urls:
+            logger.warning("Nenhum host ativo em %s. Pulando.", target.label)
+            return
+
+    # Disponibiliza confirmed_hosts para o filtro de endpoints
+    cfg["confirmed_hosts"] = confirmed_hosts
+
+    # ── 4. Coleta de JS ───────────────────────────────────────────────────────
+    js_urls = collect_all_js(alive_urls, confirmed_hosts, cfg, logger,
+                              single_target=target.is_single)
     stats["js"] = len(js_urls)
 
-    # ── 5. Análise de JS ───────────────────────────────────────────────────────
+    # ── 5. Análise de JS ──────────────────────────────────────────────────────
     logger.info("═══ Análise de JS (%d arquivos) ═══", len(js_urls))
     total_eps = analyze_js_list(sorted(js_urls), cfg, logger)
     logger.info("Endpoints extraídos: %d", total_eps)
 
-    # ── 5b. Salva endpoints.txt ───────────────────────────────────────────────
     write_endpoints_txt(cfg, logger)
 
-    # ── 6. Validação ───────────────────────────────────────────────────────────
-    val_results: list[dict] = []
+    # ── 6. Validação ──────────────────────────────────────────────────────────
+    val_results = []
     if not args.no_validate:
         val_results = validate_all_endpoints(cfg, logger)
     else:
@@ -1496,8 +1745,56 @@ def main() -> None:
     write_summary_txt(cfg, logger, stats, val_results)
 
     logger.info("=" * 66)
-    logger.info("  Concluído. Saída: %s", cfg["out_dir"])
+    logger.info("  Concluído: %s  →  %s", target.label, cfg["out_dir"])
     logger.info("=" * 66)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = parse_args()
+
+    # Carrega alvos (arquivo .txt ou alvo direto)
+    targets = load_targets(args.target)
+
+    if not targets:
+        print("Nenhum alvo encontrado.")
+        sys.exit(1)
+
+    # Logger global (antes de criar cfg individual por alvo)
+    log_dir = Path(f"jsrecon2_{re.sub(r'[^\\w.\\-]', '_', targets[0].safe_dirname())}")
+    log_dir.mkdir(exist_ok=True)
+    logger = setup_logging(log_dir / "jsrecon2.log")
+
+    preflight(logger)
+
+    if len(targets) > 1:
+        logger.info("Modo multi-alvo: %d alvos carregados de '%s'",
+                    len(targets), args.target)
+
+    # FIX: Playwright requer --no-live se não instalado
+    if not HAS_PLAYWRIGHT and not args.no_live:
+        logger.warning(
+            "Playwright não instalado — coleta via browser desativada automaticamente.\n"
+            "Para ativar: pip install playwright && playwright install chromium\n"
+            "Para suprimir este aviso: passe --no-live"
+        )
+        args.no_live = True
+
+    for i, target in enumerate(targets, 1):
+        if len(targets) > 1:
+            logger.info("\n[%d/%d] Processando: %s", i, len(targets), target.label)
+        try:
+            run_target(target, args, logger)
+        except KeyboardInterrupt:
+            logger.warning("Interrompido pelo usuário.")
+            sys.exit(0)
+        except Exception as e:
+            logger.error("Erro ao processar %s: %s", target.label, e)
+            if len(targets) == 1:
+                raise
+            # Multi-alvo: continua para o próximo mesmo em caso de erro
 
 
 if __name__ == "__main__":
