@@ -748,22 +748,125 @@ _POST_LABELS: set[str] = {
     "graphql", "graphql_url", "webhook_url",
 }
 
-# ─── Extração de body params do JS ────────────────────────────────────────────
-_BODY_RE = re.compile(
-    r'(?:body|data|payload)\s*[:=]\s*(?:JSON\.stringify\s*)?\{([^}]{1,600})\}',
-    re.I | re.DOTALL
-)
-_KEY_RE = re.compile(r'["\']([a-zA-Z_][a-zA-Z0-9_]{1,40})["\']')
+# ─── Extração de body params do JS ───────────────────────────────────────────
+#
+# Três casos tratados:
+#   1. JSON.stringify({ key: val })   — chaves SEM aspas (JS shorthand)
+#   2. JSON.stringify({ "key": val }) — chaves COM aspas
+#   3. JSON.stringify(VAR)            — variável: rastreia a definição no JS
+#
+# O regex antigo (_BODY_RE + _KEY_RE) falhava em (1) e (3), que são
+# exatamente os padrões usados pelo JS minificado/beautificado moderno.
+
+_BODY_SKIP: frozenset[str] = frozenset({
+    'null', 'true', 'false', 'undefined', 'method', 'headers', 'body',
+    'Content', 'Type', 'application', 'json', 'catch', 'then', 'ok',
+    'status', 'length', 'error', 'const', 'let', 'var', 'await', 'async',
+    'return', 'throw', 'new', 'Error', 'Promise', 'console', 'log', 'warn',
+    'JSON', 'stringify', 'Object', 'Array', 'fetch', 'axios', 'http',
+    'if', 'else', 'for', 'while', 'try', 'function', 'class',
+})
+
+_STRINGIFY_RE = re.compile(r'JSON\.stringify\s*\(\s*', re.I)
+_UNQUOTED_KEY = re.compile(r'(?:^|[{,\s])([a-zA-Z_][a-zA-Z0-9_]{1,40})\s*:')
+_QUOTED_KEY   = re.compile(r'["\']([a-zA-Z_][a-zA-Z0-9_]{1,40})["\']')
+
+
+def _balance_braces(text: str, start: int) -> str:
+    """Retorna o conteúdo do objeto JS a partir de '{' em start."""
+    if start >= len(text) or text[start] != '{':
+        return ""
+    depth = 0
+    i = start
+    while i < len(text):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start: i + 1]
+        i += 1
+    return text[start:]
+
+
+def _keys_from_object(obj: str) -> list[str]:
+    """
+    Extrai chaves de PRIMEIRO NÍVEL de um objeto JS (com e sem aspas).
+
+    Estratégia: remove as chaves { } externas, trabalha só com o
+    interior, depois colapsa sub-objetos aninhados para {}.
+    Assim as chaves do nível raiz ficam expostas e as internas somem.
+
+    Ex: { lead: S, domain: A, scan_metrics: { overallScore: x } }
+        -> ['lead', 'domain', 'scan_metrics']  (overallScore descartado)
+
+    Bug anterior: re.sub colapsia o OBJETO RAIZ inteiro para {} quando
+    ele não tinha sub-objetos — apagava tudo. Fix: stripa as chaves
+    externas antes de colapsar.
+    """
+    # Strip das chaves externas: trabalha com o interior
+    interior = obj.strip()
+    if interior.startswith('{') and interior.endswith('}'):
+        interior = interior[1:-1]
+
+    # Colapsa sub-objetos aninhados {…} para {} (nivel raiz não afetado)
+    flat = interior
+    for _ in range(8):
+        collapsed = re.sub(r'\{[^{}]*\}', '{}', flat)
+        if collapsed == flat:
+            break
+        flat = collapsed
+
+    params = []
+    for k in _QUOTED_KEY.findall(flat):
+        if k not in _BODY_SKIP and len(k) > 1:
+            params.append(k)
+    for k in _UNQUOTED_KEY.findall(flat):
+        if k not in _BODY_SKIP and not k[0].isupper() and len(k) > 1:
+            params.append(k)
+    return list(dict.fromkeys(params))
+
 
 def extract_body_params(content: str, pos: int) -> list[str]:
-    window = content[max(0, pos - 200): pos + 600]
-    params = []
-    for bm in _BODY_RE.finditer(window):
-        for km in _KEY_RE.finditer(bm.group(1)):
-            k = km.group(1)
-            if k not in ("null", "true", "false", "undefined"):
-                params.append(k)
-    return list(dict.fromkeys(params))
+    window = content[max(0, pos - 100): pos + 900]
+
+    for sm in _STRINGIFY_RE.finditer(window):
+        start = sm.end()
+        if start >= len(window):
+            continue
+
+        ch = window[start]
+
+        # ── Caso 1 & 2: objeto literal ────────────────────────────────────
+        if ch == '{':
+            obj = _balance_braces(window, start)
+            if obj:
+                return _keys_from_object(obj)
+
+        # ── Caso 3: variável — rastreia definição ─────────────────────────
+        elif re.match(r'[A-Za-z_$]', ch):
+            vm = re.match(r'([A-Za-z_$][A-Za-z0-9_$]*)', window[start:])
+            if not vm:
+                continue
+            var_name = vm.group(1)
+
+            # Busca numa janela maior atrás do endpoint
+            big = content[max(0, pos - 3000): pos + 50]
+            var_def = re.compile(
+                rf'(?:const|let|var)?\s*{re.escape(var_name)}\s*=\s*\{{',
+                re.I,
+            )
+            for vd in var_def.finditer(big):
+                obj_start = big.index('{', vd.start())
+                obj = _balance_braces(big, obj_start)
+                if obj:
+                    keys = _keys_from_object(obj)
+                    if keys:
+                        return keys
+
+        break  # só o primeiro JSON.stringify após o endpoint
+
+    return []
 
 # ─── Extração de headers mencionados no JS ────────────────────────────────────
 # Extrai apenas headers que o código JS menciona explicitamente.
