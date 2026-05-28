@@ -494,10 +494,36 @@ def collect_js_tools(domain: str, alive_urls: list[str],
 # ─── Fase 1-E: Playwright ─────────────────────────────────────────────────────
 async def _pw_crawl(url: str, timeout_s: int, wait_s: int,
                     headless: bool, lg: logging.Logger) -> list[str]:
+    """
+    Captura todos os arquivos .js carregados pelo browser.
+
+    Correções:
+    - Usa "response" em vez de "request" para capturar JS da página FINAL
+      após redirect HTTP→HTTPS (o request event dispara antes do redirect,
+      o response event dispara na URL final já resolvida).
+    - Se goto() falha com HTTP e a URL não é HTTPS, tenta automaticamente
+      a versão HTTPS antes de desistir.
+    - wait_until="load" em vez de "networkidle": networkidle aguarda 500ms
+      sem requests, mas SPAs modernas fazem lazy-load de JS após interação.
+      "load" captura o bundle principal e depois dormimos wait_s para lazy.
+    - Extrai também srcs de <script src="..."> do DOM renderizado como
+      fallback para JS injetados via innerHTML/document.write.
+    """
     if not HAS_PLAYWRIGHT:
         return []
+
     found: list[str] = []
-    seen: set[str] = set()
+    seen:  set[str]  = set()
+
+    def _accept(ru: str) -> bool:
+        if ".js" not in urlparse(ru).path.lower():
+            return False
+        if _CDN_RE.search(ru):
+            return False
+        if ru in seen:
+            return False
+        return True
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         ctx = await browser.new_context(
@@ -505,34 +531,88 @@ async def _pw_crawl(url: str, timeout_s: int, wait_s: int,
             ignore_https_errors=True,
         )
         page = await ctx.new_page()
-        def on_req(req):
-            ru = req.url
-            if ".js" in urlparse(ru).path.lower() and ru not in seen:
-                if not _CDN_RE.search(ru):
-                    seen.add(ru)
-                    found.append(ru)
-        page.on("request", on_req)
+
+        # ── "response" captura a URL final após todos os redirects ───────────
+        def on_response(resp):
+            ru = resp.url
+            if _accept(ru):
+                seen.add(ru)
+                found.append(ru)
+
+        page.on("response", on_response)
+
+        # ── Tentativa 1: URL original ────────────────────────────────────────
+        nav_ok = False
         try:
-            await page.goto(url, timeout=timeout_s * 1000, wait_until="networkidle")
+            await page.goto(url, timeout=timeout_s * 1000, wait_until="load")
+            nav_ok = True
         except Exception as e:
-            lg.debug("  [browser] timeout %s: %s", url, e)
-        if wait_s > 0:
-            await asyncio.sleep(wait_s)
+            lg.debug("  [browser] goto(%s) falhou: %s", url, e)
+
+        # ── Tentativa 2: fallback HTTPS se URL era HTTP ───────────────────────
+        if not nav_ok and url.startswith("http://"):
+            https_url = url.replace("http://", "https://", 1)
+            lg.debug("  [browser] tentando HTTPS: %s", https_url)
+            try:
+                await page.goto(https_url, timeout=timeout_s * 1000, wait_until="load")
+                nav_ok = True
+                lg.debug("  [browser] HTTPS OK: %s", https_url)
+            except Exception as e2:
+                lg.debug("  [browser] HTTPS também falhou: %s", e2)
+
+        if nav_ok:
+            # Aguarda lazy-load de JS (SPAs injetam scripts após DOMContentLoaded)
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+
+            # ── Fallback DOM: extrai <script src="..."> do HTML renderizado ──
+            try:
+                script_srcs = await page.eval_on_selector_all(
+                    "script[src]",
+                    "els => els.map(e => e.src)"
+                )
+                for src in script_srcs:
+                    if src and _accept(src):
+                        seen.add(src)
+                        found.append(src)
+            except Exception as e:
+                lg.debug("  [browser] eval script srcs: %s", e)
+
         await browser.close()
+
     return found
+
 
 async def playwright_all(targets: list[str], headless: bool,
                          lg: logging.Logger) -> set[str]:
+    """
+    Roda _pw_crawl em cada target.
+
+    Correção: prioriza a versão HTTPS de cada host antes de tentar HTTP.
+    Se hosts_alive.txt contém tanto http://host quanto https://host,
+    deduplica por netloc e usa sempre HTTPS quando disponível.
+    """
+    # Deduplica por netloc, preferindo HTTPS
+    netloc_best: dict[str, str] = {}
+    for url in targets:
+        netloc = urlparse(url).netloc.lower()
+        existing = netloc_best.get(netloc, "")
+        if not existing or url.startswith("https://"):
+            netloc_best[netloc] = url
+
+    deduped = list(netloc_best.values())
+
     all_js: set[str] = set()
-    for i, url in enumerate(targets, 1):
-        clog(lg, f"  [browser {i}/{len(targets)}] {url}", C.CYAN)
+    for i, url in enumerate(deduped, 1):
+        clog(lg, f"  [browser {i}/{len(deduped)}] {url}", C.CYAN)
         try:
-            files = await _pw_crawl(url, timeout_s=30, wait_s=2,
+            files = await _pw_crawl(url, timeout_s=35, wait_s=3,
                                     headless=headless, lg=lg)
             all_js.update(files)
-            clog(lg, f"    → {len(files)} JS", C.DIM)
+            clog(lg, f"    → {len(files)} JS encontrados", C.GREEN if files else C.DIM)
         except Exception as e:
             lg.error("  [browser] %s: %s", url, e)
+
     return all_js
 
 # ─── Fase 2: Filtro de endpoints ──────────────────────────────────────────────
@@ -1907,16 +1987,35 @@ def main() -> None:
         js_from_browser: set[str] = set()
         if not args.no_live and HAS_PLAYWRIGHT:
             clog(lg, "\n━━━ Playwright ━━━", C.BLUE + C.BOLD)
-            seen_hosts: set[str] = set()
-            targets = []
+
+            # Monta targets deduplicando por HOSTNAME (não netloc completo).
+            # alive_urls pode conter http://host, https://host, https://host:443
+            # para o mesmo servidor — todos têm netloc diferente mas mesmo host.
+            # Regra: 1 URL por hostname, preferindo HTTPS sobre HTTP,
+            # e porta padrão (443/80) sobre porta explícita.
+            host_best: dict[str, str] = {}
             for url in alive_urls:
-                parsed = urlparse(url)
-                if single and parsed.netloc.lower().split(":")[0] != domain.lower():
+                parsed  = urlparse(url)
+                host    = parsed.hostname or ""
+                if not host:
                     continue
-                key = parsed.netloc
-                if key not in seen_hosts:
-                    seen_hosts.add(key)
-                    targets.append(url)
+                if single and host != domain.lower():
+                    continue
+                existing = host_best.get(host, "")
+                # Prefere HTTPS; entre duas HTTPS, prefere sem porta explícita
+                if not existing:
+                    host_best[host] = url
+                elif url.startswith("https://") and existing.startswith("http://"):
+                    host_best[host] = url
+                elif (url.startswith("https://") and existing.startswith("https://")
+                      and parsed.port in (None, 443)
+                      and urlparse(existing).port not in (None, 443)):
+                    host_best[host] = url
+
+            targets = list(host_best.values())
+            clog(lg, f"  Targets para browser: {len(targets)}", C.CYAN)
+            for t in targets:
+                clog(lg, f"    {t}", C.DIM)
             js_from_browser = asyncio.run(
                 playwright_all(targets, not args.no_headless, lg)
             )
